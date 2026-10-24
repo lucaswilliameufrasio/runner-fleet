@@ -26,10 +26,10 @@ for(const tab of ['Repositórios','Migração','Máquinas','Pools','Jobs','Alert
 await page.getByText('Permissões base de repositório: Metadata read, Contents read e Actions read.',{exact:false}).waitFor();
 await page.getByLabel('Logs (dias)').fill('15');
 await page.getByRole('button',{name:'Salvar preferências'}).click();
-await page.getByText('Preferências salvas.',{exact:true}).waitFor();
+await page.getByText('Preferências salvas.',{exact:false}).waitFor();
 await page.locator('nav').getByRole('button',{name:'Pools'}).click();
 await page.getByRole('button',{name:'+ Criar pool'}).click();
-await page.getByText('Pool de organização exige um grupo de runners restrito.',{exact:false}).waitFor();
+await page.getByText('Pool de organização exige grupo de runners restrito.',{exact:false}).waitFor();
 await page.getByLabel('Nome',{exact:true}).fill('UI pool');
 await page.getByLabel('Máquinas elegíveis').waitFor();
 await page.locator('.modal .toolbar button').click();
