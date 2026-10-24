@@ -1,0 +1,19 @@
+[Unit]
+Description=Runner Fleet control plane
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=fleet
+Group=fleet
+WorkingDirectory=/opt/runner-fleet
+ExecStart=/opt/runner-fleet/bin/runner-fleet-server serve --data /var/lib/runner-fleet --web /opt/runner-fleet/web/build --listen 127.0.0.1:8080 --origin https://fleet.example.com --agent-url wss://agents.example.com/agent --agent-listen 127.0.0.1:8443 --tls-cert /etc/runner-fleet/tls/fullchain.pem --tls-key /etc/runner-fleet/tls/privkey.pem
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/runner-fleet
+UMask=0077
+[Install]
+WantedBy=multi-user.target

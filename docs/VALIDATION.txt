@@ -1,0 +1,16 @@
+?   	runnerfleet/cmd/agent	[no test files]
+?   	runnerfleet/cmd/server	[no test files]
+ok  	runnerfleet/internal/agent	1.021s
+ok  	runnerfleet/internal/backups	(cached)
+ok  	runnerfleet/internal/bootstrap	(cached)
+ok  	runnerfleet/internal/capacity	(cached)
+ok  	runnerfleet/internal/discovery	(cached)
+ok  	runnerfleet/internal/github	1.070s
+ok  	runnerfleet/internal/security	(cached)
+ok  	runnerfleet/internal/server	2.851s
+?   	runnerfleet/internal/store	[no test files]
+HTTP artifact smoke passed: SPA assets/CSP, setup, login, CSRF, reauth, enrollment, export, logout.
+
+Front-end: npm run check (0 errors, 0 warnings) and npm run build passed in release.sh.
+Ed25519 signature and all SHA256SUMS verified.
+Browser E2E not executed successfully: environment blocks Chromium ProcessSingleton Unix socket.

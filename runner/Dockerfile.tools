@@ -1,0 +1,15 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG PROFILE
+ARG NODE_VERSION=22.14.0
+ARG BUN_VERSION=1.2.22
+ARG GO_VERSION=1.25.1
+ARG RUST_VERSION=1.90.0
+# Toolchains installed via official TLS endpoints; publish and pin the resulting digest.
+RUN case "$PROFILE" in \
+ node) arch=$(uname -m); case "$arch" in x86_64) arch=x64;; aarch64) arch=arm64;; esac; curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" | tar xJ -C /usr/local --strip-components=1; curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}";; \
+ go) arch=$(uname -m); case "$arch" in x86_64) arch=amd64;; aarch64) arch=arm64;; esac; curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" | tar xz -C /usr/local;; \
+ rust) curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VERSION";; \
+ docker) apt-get update; apt-get install -y --no-install-recommends docker.io; rm -rf /var/lib/apt/lists/*;; \
+ *) exit 1;; esac
+ENV PATH=/usr/local/go/bin:/root/.cargo/bin:/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
