@@ -19,14 +19,17 @@ await page.getByLabel('Senha',{exact:true}).fill('test secure password');
 await page.getByRole('button',{name:'Confirmar',exact:true}).click();
 await page.getByRole('button',{name:'+ Adicionar máquina',exact:true}).click();
 await page.getByRole('heading',{name:'Cadastrar máquina'}).waitFor();
-await page.getByLabel('Código — válido por 15 minutos, uso único').waitFor();
+await page.getByLabel('Código — expira em 15 minutos e só pode ser usado uma vez').waitFor();
+await page.getByText('Execute este fluxo no host Linux que vai receber os jobs',{exact:false}).waitFor();
 await page.locator('.modal .toolbar button').click();
 for(const tab of ['Repositórios','Migração','Máquinas','Pools','Jobs','Alertas','Auditoria','Configurações']){await page.locator('nav').getByRole('button',{name:tab,exact:false}).click();await page.locator('header h1').filter({hasText:tab}).waitFor()}
+await page.getByText('Permissões base de repositório: Metadata read, Contents read e Actions read.',{exact:false}).waitFor();
 await page.getByLabel('Logs (dias)').fill('15');
 await page.getByRole('button',{name:'Salvar preferências'}).click();
 await page.getByText('Preferências salvas.',{exact:true}).waitFor();
 await page.locator('nav').getByRole('button',{name:'Pools'}).click();
 await page.getByRole('button',{name:'+ Criar pool'}).click();
+await page.getByText('Pool de organização exige um grupo de runners restrito.',{exact:false}).waitFor();
 await page.getByLabel('Nome',{exact:true}).fill('UI pool');
 await page.getByLabel('Máquinas elegíveis').waitFor();
 await page.locator('.modal .toolbar button').click();
