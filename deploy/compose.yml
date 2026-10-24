@@ -3,8 +3,13 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    image: runner-fleet-server:local
     restart: unless-stopped
-    command: [serve, --data, /data, --web, /app/web, --listen, '0.0.0.0:8080', --origin, '${RF_ORIGIN}', --agent-url, '${RF_AGENT_URL}', --agent-listen, ':8443', --tls-cert, /tls/fullchain.pem, --tls-key, /tls/privkey.pem]
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    command: [serve, --data, /data, --web, /app/web, --listen, '0.0.0.0:8080', --origin, '${RF_ORIGIN:?set RF_ORIGIN to the public HTTPS panel URL}', --agent-url, '${RF_AGENT_URL:?set RF_AGENT_URL to the public WSS agent URL}', --agent-listen, ':8443', --tls-cert, /tls/fullchain.pem, --tls-key, /tls/privkey.pem]
     ports:
       - '127.0.0.1:8080:8080'
       - '127.0.0.1:8443:8443'
@@ -14,3 +19,5 @@ services:
       - ../web/build/downloads:/app/web/downloads:ro
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
+    pids_limit: 128
+    stop_grace_period: 10s

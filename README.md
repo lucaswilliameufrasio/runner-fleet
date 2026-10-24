@@ -37,7 +37,7 @@ Configure o proxy HTTPS conforme `deploy/nginx-sni.conf`. Os dois hostnames usam
 
 Abra `/setup`, use o código (30 minutos) e crie o admin. `/setup` e outras rotas do painel recebem o fallback da SPA. `--dev` apenas para HTTP no localhost; não use em produção.
 
-Se usar systemd, copie binários, painel e arquivos de serviço, crie o usuário `fleet` e dê a ele acesso ao diretório de dados e ao certificado/chave TLS. `deploy/compose.yml` é alternativa; prepare `deploy/data` com UID 10001 e arquivos de TLS legíveis pelo mesmo UID. Em Compose:
+Se usar systemd, copie binários, painel e arquivos de serviço, crie o usuário `fleet` e dê a ele acesso ao diretório de dados e ao certificado/chave TLS. `deploy/compose.yml` é a alternativa de produção: a imagem roda como UID 10001, filesystem somente leitura, sem capabilities e com portas publicadas apenas em loopback para o proxy HTTPS. Prepare `deploy/data` com UID 10001 e arquivos TLS legíveis por esse UID. A configuração exige origem/público corretos e não precisa de credenciais ou chamadas ao GitHub para build/configuração:
 
 ```sh
 export RF_ORIGIN=https://fleet.example.com
@@ -46,6 +46,8 @@ docker compose -f deploy/compose.yml build
 docker compose -f deploy/compose.yml run --rm fleet setup-code --data /data
 docker compose -f deploy/compose.yml up -d
 ```
+
+O build requer Docker/BuildKit, acesso aos registries das imagens-base, pacotes npm (via pnpm) e módulos Go; não requer GitHub App, token ou runner do GitHub. O painel fixa pnpm 12.15.0 em `web/package.json` e aprova somente o build do `esbuild` travado no lockfile. `docker compose ... config --quiet` valida a configuração sem subir serviços. O smoke HTTP pode usar `GET /api/health` em instalação local isolada; testes de integração com a API do GitHub continuam usando fixtures/fakes e não validam permissões, rate limits ou webhooks reais.
 
 O build Docker compila o projeto, mas as releases de agentes assinadas precisam ser publicadas em `web/build/downloads`. Nos binários incluídos, esse diretório já está preparado. Para Compose, monte-o conforme o exemplo de volume no arquivo de configuração.
 
@@ -143,7 +145,7 @@ Perdeu login: `server recover --data ./data`, use o código em Recuperação por
 go test ./...
 go test -race ./...
 go vet ./...
-(cd web && npm ci && npm run check && npm run build)
+(cd web && corepack pnpm install --frozen-lockfile && corepack pnpm run check && corepack pnpm run build)
 go build -buildvcs=false -o bin/server ./cmd/server
 go build -buildvcs=false -o bin/agent ./cmd/agent
 ```

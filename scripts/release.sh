@@ -5,7 +5,7 @@ GO=${GO:-go}
 : "${RF_SIGNING_KEY_FILE:?Set path to Ed25519 private release signing key}"
 root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
-(cd web && npm ci && npm run check && npm run build)
+(cd web && corepack pnpm install --frozen-lockfile && corepack pnpm run check && corepack pnpm run build)
 mkdir -p dist web/build/downloads
 for arch in amd64 arm64; do
  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" "$GO" build -buildvcs=false -trimpath -ldflags='-s -w' -o "dist/runner-fleet-server-linux-$arch" ./cmd/server
