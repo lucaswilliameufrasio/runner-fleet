@@ -106,6 +106,18 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 Crie perfis Node/Bun, Go, Rust e Docker com `runner/Dockerfile.tools`, `BASE_IMAGE` fixada por digest e `PROFILE=node|go|rust|docker`. Os defaults de versão são explícitos; ajuste conforme seu workflow. Publishe e copie o digest para o pool. Não use `latest` como referência de execução.
 
+### Workers AWS EC2 Spot
+
+Um pool pode incluir máquinas cadastradas, workers EC2 Spot gerenciados pelo Fleet, ou ambos. O scheduler cria capacidade cloud conforme `min`, jobs compatíveis em fila, `max`, limites globais e slots por máquina; as instâncias sem runners/jobs são encerradas após o período ocioso e drain do runner. Os lançamentos ficam persistidos e reconciliados por client token e tags antes de repetir uma chamada EC2 ambígua.
+
+Na configuração do pool, selecione região, AMI, Ubuntu/Debian com bootstrap ou AMI pré-preparada, subnets, security groups, tipos Spot permitidos, máquinas máximas, slots e volume raiz. Fallback On-Demand fica desligado por padrão; para habilitar, configure uma lista separada de tipos e um atraso. O fallback só ocorre depois de erro AWS conhecido de falta/limite de capacidade Spot, não por erro de autenticação, rede ou configuração. Alterar/ativar a configuração AWS exige reautenticação. Limite o `max` do pool e a IAM policy: fallback On-Demand pode aumentar a tarifa.
+
+O processo do servidor usa a cadeia padrão de credenciais AWS do SDK (role de instância, web identity, profile/config, conforme o ambiente); chaves não são enviadas ao navegador nem guardadas no SQLite. O operador deve fornecer IAM para `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeImages`, `ec2:DescribeInstanceTypes`, `ec2:TerminateInstances`, `ec2:CreateTags` e `iam:PassRole` apenas para o instance profile escolhido. O Fleet não cria VPC, subnets, security groups, AMIs ou roles. A instância precisa de egress HTTPS ao Fleet e GitHub; modo bootstrap também instala Docker rootless e depende dos repositórios/serviços HTTPS da distro e do instalador oficial.
+
+O bootstrap usa um código de enrollment de uso único e curta duração em user-data, valida o instance ID recebido via IMDSv2 contra o lançamento persistido, e elimina o código após enrollment. Restrinja quem pode ler user-data/metadata e não o inclua em logs. A AMI pre-configurada deve ter systemd, cgroup v2 e Docker rootless funcional para `fleet-agent`; o modo bootstrap é para imagens Ubuntu/Debian compatíveis. Tipos EC2 e AMI são verificados contra a arquitetura do pool e a capacidade real de vCPU/memória antes do registro.
+
+O agente consulta o aviso Spot em IMDSv2, sinaliza a interrupção, impede novas reservas e inicia drain dos runners ociosos. Isso é best-effort: jobs ativos podem ser terminados pela AWS antes de concluir. Reclaim, suspensão do control plane e falhas de rede não têm garantia de preservação/reexecução de jobs. O painel mostra o estado dos launches. Testes locais usam EC2 fake; faça o canário de `docs/CANARY.md` em uma conta/subnets de teste antes de habilitar pools reais.
+
 No painel: configure máquina (slots, CPU, memória, disco, horários), crie pool pausado, selecione instalação/escopo/grupo/labels/imagem/máquinas, reconheça workloads confiáveis e execute canário antes de ativar. CPU e memória são limites reais do container, sujeitos ao suporte cgroups da máquina. Disco é budget de reserva + pressão de espaço livre, não quota rígida de filesystem por job.
 
 Docker sidecar usa daemon novo por job, volumes exclusivos para workspace/socket e rede compartilhada com o runner. O socket do Docker do host nunca é montado. Exige máquina dedicada, runtime rootless, imagem Docker daemon por digest e pelo menos 2 CPUs/2 GB por slot. Sidecar é privilegiado dentro do runtime rootless: use somente código confiável. Execute build, push, container actions e service containers de canário na sua distro. Não foi homologado neste ambiente sem Docker.
@@ -152,6 +164,6 @@ go build -buildvcs=false -o bin/agent ./cmd/agent
 
 `tests/ui.mjs` testa a interface contra uma instalação local vazia em localhost:8080; requer Playwright/Chromium e `RF_TEST_CODE_FILE`. O script usa dados fictícios. Não aponte para instalação real.
 
-Para novas releases, gere sua própria chave fora do repo (`openssl genpkey -algorithm ED25519 -out /diretorio/seguro/release.key`) e execute `RF_SIGNING_KEY_FILE=... scripts/release.sh`. Use a chave já confiada pelas máquinas ou faça rotação manual de confiança. A chave privada da release do pacote não está distribuída.
+Para novas releases, use o secret manager do ambiente para injetar o conteúdo da chave privada Ed25519 em `RF_SIGNING_KEY` ao executar `scripts/release.sh` (não coloque o valor em comandos, arquivos do repositório ou logs). O script materializa a chave em arquivo temporário com permissões restritas e o remove ao terminar. Use a chave já confiada pelas máquinas ou faça rotação manual de confiança. A chave privada da release do pacote não está distribuída.
 
 Veja `docs/ADR.md`, `docs/CANARY.md` e `IMPLEMENTATION_STATUS.md`. Roadmap: múltiplos usuários/RBAC, API/MCP, VM/microVM, distribuições extras e macOS/Windows.

@@ -24,6 +24,7 @@ import (
 	"runnerfleet/internal/capacity"
 	"runnerfleet/internal/github"
 	"runnerfleet/internal/security"
+	"runnerfleet/internal/spot"
 	"runnerfleet/internal/store"
 	"strconv"
 	"strings"
@@ -36,15 +37,17 @@ type Config struct {
 	Dev                               bool
 }
 type Server struct {
-	Store    *store.Store
-	Cfg      Config
-	Key      []byte
-	CA       *security.CA
-	mu       sync.Mutex
-	channels map[string]*websocket.Conn
-	limits   map[string]*limit
-	ctx      context.Context
-	ghClient *github.Client
+	Store         *store.Store
+	Cfg           Config
+	Key           []byte
+	CA            *security.CA
+	mu            sync.Mutex
+	channels      map[string]*websocket.Conn
+	limits        map[string]*limit
+	ctx           context.Context
+	ghClient      *github.Client
+	spotMu        sync.Mutex
+	spotProviders map[string]*spot.Provider
 }
 type limit struct {
 	count int
@@ -64,7 +67,7 @@ func New(cfg Config) (*Server, error) {
 	if e != nil {
 		return nil, e
 	}
-	v := &Server{Store: s, Cfg: cfg, Key: key, CA: ca, channels: map[string]*websocket.Conn{}, limits: map[string]*limit{}}
+	v := &Server{Store: s, Cfg: cfg, Key: key, CA: ca, channels: map[string]*websocket.Conn{}, limits: map[string]*limit{}, spotProviders: map[string]*spot.Provider{}}
 	if s.Get("installation_id") == "" {
 		s.Set("installation_id", security.Random(16))
 	}
@@ -456,6 +459,20 @@ func (s *Server) snapshot() map[string]any {
 	if e == nil {
 		v["instances"] = instances
 	}
+	launches := []map[string]any{}
+	rows, err := s.Store.DB.Query(`SELECT id,pool,market,instance_type,state,instance_id,machine_id,attempts,next,error,created,updated FROM spot_launches ORDER BY updated DESC LIMIT 500`)
+	if err == nil {
+		for rows.Next() {
+			var id, poolID, market, instanceType, state, instanceID, machineID, errorCode string
+			var attempts int
+			var next, created, updated int64
+			if rows.Scan(&id, &poolID, &market, &instanceType, &state, &instanceID, &machineID, &attempts, &next, &errorCode, &created, &updated) == nil {
+				launches = append(launches, map[string]any{"id": id, "pool": poolID, "market": market, "instance_type": instanceType, "state": state, "instance_id": instanceID, "machine_id": machineID, "attempts": attempts, "next": next, "error_code": errorCode, "created": created, "updated": updated})
+			}
+		}
+		rows.Close()
+	}
+	v["spot_launch"] = launches
 	v["analytics"] = s.analytics()
 	v["time"] = time.Now().Unix()
 	return v
@@ -633,7 +650,13 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		fail(w, 429, "try later")
 		return
 	}
-	var v struct{ Code, CSR, Name, Arch string }
+	var v struct {
+		Code            string `json:"code"`
+		CSR             string `json:"csr"`
+		Name            string `json:"name"`
+		Arch            string `json:"arch"`
+		CloudInstanceID string `json:"cloud_instance_id"`
+	}
 	if !decode(w, r, &v) {
 		return
 	}
@@ -663,7 +686,60 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "invalid/used/expired enrollment code")
 		return
 	}
+	var launchID, poolID, market, launchType, expectedInstanceID, launchState, launchArch, poolSnapshot string
+	var launchCPU float64
+	var launchMemory int64
+	launchErr := tx.QueryRow(`SELECT id,pool,market,instance_type,instance_id,state,architecture,cpu,memory_mb,pool_snapshot FROM spot_launches WHERE enrollment_hash=?`, security.Hash(v.Code)).Scan(&launchID, &poolID, &market, &launchType, &expectedInstanceID, &launchState, &launchArch, &launchCPU, &launchMemory, &poolSnapshot)
+	if launchErr == nil {
+		if v.CloudInstanceID == "" || v.CloudInstanceID != expectedInstanceID || launchState != "running" || launchCPU <= 0 || launchMemory < 512 || launchArch != v.Arch {
+			fail(w, 403, "cloud enrollment identity mismatch")
+			return
+		}
+	} else if !errors.Is(launchErr, sql.ErrNoRows) || v.CloudInstanceID != "" {
+		fail(w, 403, "cloud enrollment identity mismatch")
+		return
+	}
 	m := capacity.Machine{ID: id, Name: v.Name, Arch: v.Arch, State: "enrolling", Serials: []string{serial}, MaxSlots: 1, CPU: 1, MemoryMB: 2048, DiskMB: 4096, Shared: true, Timezone: "UTC", Doctor: map[string]any{}, Telemetry: map[string]any{}}
+	if launchErr == nil {
+		m.CloudProvider = "aws"
+		m.CloudInstanceID = expectedInstanceID
+		m.ProviderPool = poolID
+		m.CloudMarket = market
+		m.CloudRegion = ""
+		m.InstanceType = launchType
+		m.CPU = launchCPU
+		m.MemoryMB = launchMemory
+		var pool capacity.Pool
+		if json.Unmarshal([]byte(poolSnapshot), &pool) != nil || pool.ID != poolID || pool.Spot == nil || capacity.Validate(pool) != nil {
+			fail(w, 403, "cloud pool is no longer configured")
+			return
+		}
+		cpuSlots := int(launchCPU / pool.CPU)
+		memorySlots := int(launchMemory / pool.MemoryMB)
+		diskSlots := int64(pool.Spot.RootVolumeGiB*1024) / pool.DiskMB
+		m.MaxSlots = min(pool.Spot.SlotsPerMachine, min(cpuSlots, min(memorySlots, int(diskSlots))))
+		if m.MaxSlots < 1 {
+			fail(w, 409, "EC2 worker cannot fit one pool job")
+			return
+		}
+		m.CloudRegion = pool.Spot.Region
+		m.DiskMB = int64(pool.Spot.RootVolumeGiB) * 1024
+		m.Shared = false
+		launchResult, updateErr := tx.Exec(`UPDATE spot_launches SET state='enrolled',machine_id=?,updated=? WHERE id=? AND state='running' AND instance_id=?`, id, time.Now().Unix(), launchID, expectedInstanceID)
+		if updateErr != nil {
+			fail(w, 500, "enrollment failed")
+			return
+		}
+		updated, _ := launchResult.RowsAffected()
+		if updated != 1 {
+			fail(w, 409, "cloud launch already enrolled")
+			return
+		}
+		if _, e = tx.Exec(`DELETE FROM kv WHERE key=?`, "spot-enrollment:"+security.Hash(v.Code)); e != nil {
+			fail(w, 500, "enrollment failed")
+			return
+		}
+	}
 	_, e = tx.Exec(`INSERT INTO resources VALUES('machine',?,?,?)`, id, store.JSON(m), time.Now().Unix())
 	if e != nil {
 		fail(w, 500, "enrollment failed")
@@ -674,7 +750,11 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Store.Audit("enrollment", "machine.create", id, "success")
-	write(w, 201, map[string]any{"id": id, "cert": cert, "ca": string(s.CA.PEM), "agent_url": s.Cfg.AgentURL})
+	response := map[string]any{"id": id, "cert": cert, "ca": string(s.CA.PEM), "agent_url": s.Cfg.AgentURL}
+	if launchErr == nil {
+		response["cloud_instance_id"] = expectedInstanceID
+	}
+	write(w, 201, response)
 }
 func (s *Server) machinePut(w http.ResponseWriter, r *http.Request) {
 	var v struct {
@@ -694,6 +774,10 @@ func (s *Server) machinePut(w http.ResponseWriter, r *http.Request) {
 	var m capacity.Machine
 	if s.Store.Read("machine", r.PathValue("id"), &m) != nil {
 		fail(w, 404, "machine not found")
+		return
+	}
+	if m.CloudProvider != "" {
+		fail(w, 409, "cloud worker capacity is managed by its pool")
 		return
 	}
 	if v.MaxSlots < 1 || v.MaxSlots > 100 || v.CPU <= 0 || v.MemoryMB < 512 || v.DiskMB < 1024 || v.StartHour < 0 || v.StartHour > 23 || v.EndHour < 0 || v.EndHour > 23 {
@@ -783,6 +867,14 @@ func (s *Server) poolPut(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &p) {
 		return
 	}
+	existing := capacity.Pool{}
+	previousSpot := false
+	if r.PathValue("id") != "" && s.Store.Read("pool", r.PathValue("id"), &existing) == nil {
+		previousSpot = existing.Spot != nil
+	}
+	if (p.Spot != nil || previousSpot) && !s.elevated(w, r) {
+		return
+	}
 	if e := capacity.Validate(p); e != nil {
 		fail(w, 400, e.Error())
 		return
@@ -798,11 +890,24 @@ func (s *Server) poolPut(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		id = security.Random(12)
 	}
+	if previousSpot && p.Spot == nil {
+		var launches, machines int
+		s.Store.DB.QueryRow(`SELECT COUNT(*) FROM spot_launches WHERE pool=? AND state IN ('pending','launching','running','enrolled','terminating')`, id).Scan(&launches)
+		s.Store.DB.QueryRow(`SELECT COUNT(*) FROM resources WHERE kind='machine' AND json_extract(data,'$.provider_pool')=? AND json_extract(data,'$.state') NOT IN ('terminated','revoked')`, id).Scan(&machines)
+		if launches > 0 || machines > 0 {
+			fail(w, 409, "wait for Spot workers to scale to zero before disabling or removing Spot")
+			return
+		}
+	}
 	p.ID = id
 	for _, m := range p.Machines {
 		var v capacity.Machine
 		if s.Store.Read("machine", m, &v) != nil {
 			fail(w, 400, "unknown machine")
+			return
+		}
+		if v.CloudProvider != "" {
+			fail(w, 400, "cloud workers are attached to their configured pool")
 			return
 		}
 	}
@@ -822,12 +927,22 @@ func (s *Server) poolPut(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, p)
 }
 func (s *Server) poolDelete(w http.ResponseWriter, r *http.Request) {
+	var pool capacity.Pool
+	if s.Store.Read("pool", r.PathValue("id"), &pool) == nil && pool.Spot != nil && !s.elevated(w, r) {
+		return
+	}
 	a, _ := capacity.List(s.Store)
 	for _, v := range a {
 		if v.Pool == r.PathValue("id") && capacity.Active(v.State) {
 			fail(w, 409, "drain instances before deleting pool")
 			return
 		}
+	}
+	var launches int
+	s.Store.DB.QueryRow(`SELECT COUNT(*) FROM spot_launches WHERE pool=? AND state IN ('pending','launching','running','enrolled','terminating')`, r.PathValue("id")).Scan(&launches)
+	if launches > 0 {
+		fail(w, 409, "wait for Spot workers to terminate before deleting pool")
+		return
 	}
 	s.Store.Delete("pool", r.PathValue("id"))
 	s.Store.Audit("admin", "pool.delete", r.PathValue("id"), "success")

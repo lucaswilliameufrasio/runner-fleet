@@ -3,6 +3,7 @@ package capacity
 import (
 	"path/filepath"
 	"runnerfleet/internal/store"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -99,5 +100,34 @@ func TestAllLabelsAndScopes(t *testing.T) {
 	p := Pool{Scope: "org", Target: "acme", Labels: []string{"self-hosted", "linux"}, Enabled: true}
 	if QueueReason([]Pool{p}, []string{"linux"}, "other/api") == "aguardando capacidade; confirmar grupo/acesso no GitHub" {
 		t.Fatal("cross-org matching")
+	}
+}
+
+func TestSpotPoolValidationAndFallbackPairing(t *testing.T) {
+	pool := Pool{
+		ID: "spot", Name: "Spot", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("a", 64),
+		Min: 1, Max: 4, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Trusted: true,
+		Spot: &SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "bootstrap",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 2, MaxMachines: 2, IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	if err := Validate(pool); err != nil {
+		t.Fatalf("valid Spot pool rejected: %v", err)
+	}
+	pool.Spot.OnDemandInstanceTypes = []string{"m7i.large"}
+	if err := Validate(pool); err == nil {
+		t.Fatal("fallback types without a fallback delay accepted")
+	}
+	pool.Spot.FallbackAfterSeconds = 60
+	if err := Validate(pool); err != nil {
+		t.Fatalf("valid configured fallback rejected: %v", err)
+	}
+	pool.Min = 3
+	pool.Spot.MaxMachines = 1
+	if err := Validate(pool); err == nil {
+		t.Fatal("pool minimum greater than cloud capacity accepted")
 	}
 }

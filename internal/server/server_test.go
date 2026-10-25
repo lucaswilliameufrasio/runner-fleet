@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
@@ -27,6 +28,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
+	"runnerfleet/internal/spot"
 )
 
 func testServer(t *testing.T) *Server {
@@ -132,6 +139,364 @@ func enrollTest(t *testing.T, s *Server) (tls.Certificate, string) {
 	}
 	return cert, text(body["id"])
 }
+
+func TestSpotLaunchPersistsSecretAndEnrollmentBindsInstance(t *testing.T) {
+	s := testServer(t)
+	p := capacity.Pool{
+		ID: "pool-spot-test", Name: "Spot", Installation: 1, Scope: "org", Target: "acme", Group: "Fleet",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("a", 64),
+		Min: 0, Max: 4, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: true, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 2, MaxMachines: 4,
+			IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	if err := s.Store.Put("pool", p.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.createSpotLaunch(p); err != nil {
+		t.Fatal(err)
+	}
+	var launchID, enrollmentHash, snapshot string
+	if err := s.Store.DB.QueryRow(`SELECT id,enrollment_hash,pool_snapshot FROM spot_launches WHERE pool=?`, p.ID).Scan(&launchID, &enrollmentHash, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	var persisted capacity.Pool
+	if err := json.Unmarshal([]byte(snapshot), &persisted); err != nil || persisted.ID != p.ID || persisted.Spot == nil || persisted.Spot.Region != "us-east-1" {
+		t.Fatalf("launch snapshot not persisted correctly: %+v err=%v", persisted, err)
+	}
+	code, err := s.enrollmentCode(enrollmentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(s.Store.Get("spot-enrollment:"+enrollmentHash), code) {
+		t.Fatal("enrollment code was stored in plaintext")
+	}
+	const instanceID = "i-0123456789abcdef0"
+	if _, err = s.Store.DB.Exec(`UPDATE spot_launches SET state='running',instance_id=?,cpu=2,memory_mb=8192,architecture='amd64' WHERE id=?`, instanceID, launchID); err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+	requestPayload := func(cloudID string) map[string]any {
+		return map[string]any{"code": code, "name": "rf-spot-test", "arch": "amd64", "cloud_instance_id": cloudID, "csr": csrPEM}
+	}
+	status, _, _ := request(t, s, http.MethodPost, "/api/enroll", requestPayload("i-00000000000000000"), nil, "")
+	if status != http.StatusForbidden {
+		t.Fatalf("mismatched EC2 identity got HTTP %d", status)
+	}
+	status, body, _ := request(t, s, http.MethodPost, "/api/enroll", requestPayload(instanceID), nil, "")
+	if status != http.StatusCreated || text(body["cloud_instance_id"]) != instanceID {
+		t.Fatalf("valid Spot enrollment failed: status=%d body=%v", status, body)
+	}
+	var machine capacity.Machine
+	if err = s.Store.Read("machine", text(body["id"]), &machine); err != nil {
+		t.Fatal(err)
+	}
+	if machine.CloudProvider != "aws" || machine.CloudInstanceID != instanceID || machine.ProviderPool != p.ID || machine.CloudRegion != p.Spot.Region || machine.MaxSlots != 2 || machine.CPU != 2 || machine.MemoryMB != 8192 || machine.Shared {
+		t.Fatalf("enrolled machine did not inherit trusted launch capacity: %+v", machine)
+	}
+	var state string
+	if err = s.Store.DB.QueryRow(`SELECT state FROM spot_launches WHERE id=?`, launchID).Scan(&state); err != nil || state != "enrolled" {
+		t.Fatalf("launch enrollment state=%q err=%v", state, err)
+	}
+}
+
+func TestSpotPoolChangesRequireStepUpAndPersistTypedConfiguration(t *testing.T) {
+	s := testServer(t)
+	setupCode, err := s.SetupCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, _ := request(t, s, http.MethodPost, "/api/auth/setup", map[string]any{"code": setupCode, "email": "spot@example.com", "password": "long secure password"}, nil, "")
+	if status != http.StatusCreated {
+		t.Fatalf("admin setup got HTTP %d", status)
+	}
+	status, body, cookie := request(t, s, http.MethodPost, "/api/auth/login", map[string]any{"email": "spot@example.com", "password": "long secure password"}, nil, "")
+	if status != http.StatusOK || cookie == nil {
+		t.Fatalf("admin login got HTTP %d", status)
+	}
+	csrf := text(body["csrf"])
+	pool := capacity.Pool{
+		Name: "Spot pool", Installation: 1, Scope: "repo", Target: "acme/build", Labels: []string{"self-hosted", "linux", "x64"},
+		Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("b", 64), Min: 0, Max: 4, Weight: 1,
+		CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: false, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 1, MaxMachines: 4,
+			IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	status, _, _ = request(t, s, http.MethodPost, "/api/pools", pool, cookie, csrf)
+	if status != http.StatusForbidden {
+		t.Fatalf("Spot pool write without step-up got HTTP %d", status)
+	}
+	status, _, _ = request(t, s, http.MethodPost, "/api/auth/reauth", map[string]any{"password": "long secure password"}, cookie, csrf)
+	if status != http.StatusOK {
+		t.Fatalf("step-up got HTTP %d", status)
+	}
+	status, body, _ = request(t, s, http.MethodPost, "/api/pools", pool, cookie, csrf)
+	if status != http.StatusOK {
+		t.Fatalf("Spot pool save got HTTP %d: %v", status, body)
+	}
+	var saved capacity.Pool
+	if err = s.Store.Read("pool", text(body["id"]), &saved); err != nil || saved.Spot == nil || saved.Spot.Region != "us-east-1" {
+		t.Fatalf("Spot configuration did not persist: %+v err=%v", saved, err)
+	}
+}
+
+type fakeServerEC2 struct {
+	launches      int
+	instance      *types.Instance
+	input         *ec2.RunInstancesInput
+	launchErr     error
+	hideLaunchTag bool
+}
+
+func (f *fakeServerEC2) RunInstances(_ context.Context, input *ec2.RunInstancesInput, _ ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
+	f.launches++
+	f.input = input
+	if f.launchErr != nil {
+		return nil, f.launchErr
+	}
+	if f.instance == nil {
+		f.instance = &types.Instance{
+			InstanceId: aws.String("i-0123456789abcdef0"), InstanceType: types.InstanceType("m7i.large"),
+			Architecture: types.ArchitectureValuesX8664, State: &types.InstanceState{Name: types.InstanceStateNamePending},
+		}
+	}
+	return &ec2.RunInstancesOutput{Instances: []types.Instance{*f.instance}}, nil
+}
+
+func (f *fakeServerEC2) DescribeInstances(_ context.Context, input *ec2.DescribeInstancesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error) {
+	if f.hideLaunchTag && len(input.InstanceIds) == 0 {
+		return &ec2.DescribeInstancesOutput{}, nil
+	}
+	if f.instance == nil {
+		return &ec2.DescribeInstancesOutput{}, nil
+	}
+	return &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{Instances: []types.Instance{*f.instance}}}}, nil
+}
+
+func (f *fakeServerEC2) DescribeImages(_ context.Context, _ *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	return &ec2.DescribeImagesOutput{Images: []types.Image{{
+		RootDeviceName: aws.String("/dev/xvda"), RootDeviceType: types.DeviceTypeEbs, Architecture: types.ArchitectureValuesX8664,
+	}}}, nil
+}
+
+func (f *fakeServerEC2) DescribeInstanceTypes(_ context.Context, _ *ec2.DescribeInstanceTypesInput, _ ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: []types.InstanceTypeInfo{{
+		VCpuInfo: &types.VCpuInfo{DefaultVCpus: aws.Int32(2)}, MemoryInfo: &types.MemoryInfo{SizeInMiB: aws.Int64(8192)},
+		ProcessorInfo: &types.ProcessorInfo{SupportedArchitectures: []types.ArchitectureType{types.ArchitectureTypeX8664}},
+	}}}, nil
+}
+
+func (f *fakeServerEC2) TerminateInstances(_ context.Context, input *ec2.TerminateInstancesInput, _ ...func(*ec2.Options)) (*ec2.TerminateInstancesOutput, error) {
+	if f.instance != nil {
+		f.instance.State = &types.InstanceState{Name: types.InstanceStateNameShuttingDown}
+	}
+	return &ec2.TerminateInstancesOutput{}, nil
+}
+
+func TestSpotReconcileLaunchesPersistentlyAndDoesNotDuplicate(t *testing.T) {
+	s := testServer(t)
+	s.Cfg.Origin = "https://fleet.example.test"
+	fake := &fakeServerEC2{}
+	provider, err := spot.New(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.spotProviders["us-east-1"] = provider
+	p := capacity.Pool{
+		ID: "pool-reconcile", Name: "Spot", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("c", 64),
+		Min: 1, Max: 4, Weight: 1, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: true, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 1, MaxMachines: 4, IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	if err = s.Store.Put("pool", p.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	s.reconcileSpot(context.Background())
+	if fake.launches != 1 || fake.input == nil {
+		t.Fatalf("expected one EC2 launch, got %d", fake.launches)
+	}
+	var state, instanceID string
+	if err = s.Store.DB.QueryRow(`SELECT state,instance_id FROM spot_launches WHERE pool=?`, p.ID).Scan(&state, &instanceID); err != nil || state != "running" || instanceID != "i-0123456789abcdef0" {
+		t.Fatalf("launch wasn't persisted: state=%s instance=%s err=%v", state, instanceID, err)
+	}
+	s.reconcileSpot(context.Background())
+	if fake.launches != 1 {
+		t.Fatalf("reconciliation duplicated an EC2 launch: calls=%d", fake.launches)
+	}
+}
+
+func TestDisablingSpotPoolStopsUnenrolledLaunchAndDrainsMachines(t *testing.T) {
+	s := testServer(t)
+	s.Cfg.Origin = "https://fleet.example.test"
+	fake := &fakeServerEC2{}
+	provider, err := spot.New(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.spotProviders["us-east-1"] = provider
+	p := capacity.Pool{
+		ID: "pool-disable", Name: "Spot", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("e", 64),
+		Min: 1, Max: 4, Weight: 1, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: true, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 1, MaxMachines: 4, IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	if err = s.Store.Put("pool", p.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.createSpotLaunch(p); err != nil {
+		t.Fatal(err)
+	}
+	s.reconcileSpot(context.Background())
+	if fake.launches != 1 || fake.instance == nil {
+		t.Fatalf("expected initial launch, calls=%d", fake.launches)
+	}
+	p.Enabled = false
+	if err = s.Store.Put("pool", p.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Store.DB.Exec(`UPDATE spot_launches SET next=? WHERE pool=?`, time.Now().Unix(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.reconcileSpot(context.Background())
+	if fake.launches != 1 {
+		t.Fatalf("disabled pool launched new capacity, calls=%d", fake.launches)
+	}
+	var state string
+	if err = s.Store.DB.QueryRow(`SELECT state FROM spot_launches WHERE pool=?`, p.ID).Scan(&state); err != nil || state != "terminating" {
+		t.Fatalf("disabled pool didn't terminate the unenrolled worker: state=%q err=%v", state, err)
+	}
+}
+
+func TestSpotReconciliationMarksEnrolledMachineTerminatedWhenTagLookupExpires(t *testing.T) {
+	s := testServer(t)
+	fake := &fakeServerEC2{hideLaunchTag: true, instance: &types.Instance{
+		InstanceId: aws.String("i-0123456789abcdef0"),
+		State:      &types.InstanceState{Name: types.InstanceStateNameTerminated},
+	}}
+	provider, err := spot.New(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.spotProviders["us-east-1"] = provider
+	p := capacity.Pool{
+		ID: "pool-gone", Name: "Spot", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("f", 64),
+		Min: 0, Max: 4, Weight: 1, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: true, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, SlotsPerMachine: 1, MaxMachines: 4, IdleMinutes: 10, RootVolumeGiB: 40,
+		},
+	}
+	if err = s.Store.Put("pool", p.ID, p); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.createSpotLaunch(p); err != nil {
+		t.Fatal(err)
+	}
+	var launchID string
+	if err = s.Store.DB.QueryRow(`SELECT id FROM spot_launches WHERE pool=?`, p.ID).Scan(&launchID); err != nil {
+		t.Fatal(err)
+	}
+	machine := capacity.Machine{
+		ID: "machine-gone", Name: "worker", Arch: "amd64", State: "online", CloudProvider: "aws",
+		CloudInstanceID: "i-0123456789abcdef0", CloudRegion: "us-east-1", ProviderPool: p.ID,
+	}
+	if err = s.Store.Put("machine", machine.ID, machine); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Store.DB.Exec(`UPDATE spot_launches SET state='enrolled',instance_id=?,machine_id=?,next=? WHERE id=?`, machine.CloudInstanceID, machine.ID, time.Now().Unix(), launchID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.processSpotLaunches(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Store.Read("machine", machine.ID, &machine); err != nil {
+		t.Fatal(err)
+	}
+	if machine.State != "terminated" {
+		t.Fatalf("machine state after EC2 termination=%q", machine.State)
+	}
+	var state string
+	if err = s.Store.DB.QueryRow(`SELECT state FROM spot_launches WHERE id=?`, launchID).Scan(&state); err != nil || state != "terminated" {
+		t.Fatalf("launch state after EC2 termination=%q err=%v", state, err)
+	}
+}
+
+func TestSpotFallbackOccursOnlyAfterCapacityErrorAndConfiguredDelay(t *testing.T) {
+	s := testServer(t)
+	s.Cfg.Origin = "https://fleet.example.test"
+	fake := &fakeServerEC2{launchErr: &smithy.GenericAPIError{Code: "InsufficientSpotInstanceCapacity", Message: "synthetic capacity failure", Fault: smithy.FaultServer}}
+	provider, err := spot.New(fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.spotProviders["us-east-1"] = provider
+	p := capacity.Pool{
+		ID: "pool-fallback", Name: "Spot", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux", "x64"}, Arch: "amd64", Image: "registry.test/runner@sha256:" + strings.Repeat("d", 64),
+		Min: 1, Max: 4, Weight: 1, CPU: 1, MemoryMB: 1024, DiskMB: 2048, Enabled: true, Trusted: true,
+		Spot: &capacity.SpotConfig{
+			Region: "us-east-1", ImageID: "ami-0123456789abcdef0", ImageMode: "prebaked",
+			SubnetIDs: []string{"subnet-0123456789abcdef0"}, SecurityGroupIDs: []string{"sg-0123456789abcdef0"},
+			SpotInstanceTypes: []string{"m7i.large"}, OnDemandInstanceTypes: []string{"m7i.large"},
+			SlotsPerMachine: 1, MaxMachines: 4, IdleMinutes: 10, RootVolumeGiB: 40, FallbackAfterSeconds: 60,
+		},
+	}
+	if err = s.createSpotLaunch(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Store.DB.Exec(`UPDATE spot_launches SET created=?,next=? WHERE pool=?`, time.Now().Add(-time.Minute).Unix(), time.Now().Unix(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.processSpotLaunches(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	var market, errorCode string
+	if err = s.Store.DB.QueryRow(`SELECT market,error FROM spot_launches WHERE pool=?`, p.ID).Scan(&market, &errorCode); err != nil {
+		t.Fatal(err)
+	}
+	if market != "spot" || errorCode != "InsufficientSpotInstanceCapacity" {
+		t.Fatalf("unexpected failure state: market=%s error=%s", market, errorCode)
+	}
+	fake.launchErr = nil
+	if _, err = s.Store.DB.Exec(`UPDATE spot_launches SET next=? WHERE pool=?`, time.Now().Unix(), p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.processSpotLaunches(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if fake.launches != 2 || fake.input == nil || fake.input.InstanceMarketOptions != nil {
+		t.Fatalf("expected explicit On-Demand fallback after capacity delay, calls=%d input=%+v", fake.launches, fake.input)
+	}
+	if err = s.Store.DB.QueryRow(`SELECT market FROM spot_launches WHERE pool=?`, p.ID).Scan(&market); err != nil || market != "on-demand" {
+		t.Fatalf("fallback market=%q err=%v", market, err)
+	}
+}
+
 func TestMTLSHeartbeatAndRevocation(t *testing.T) {
 	s := testServer(t)
 	s.Cfg.AgentURL = "wss://agents.example.com/agent"

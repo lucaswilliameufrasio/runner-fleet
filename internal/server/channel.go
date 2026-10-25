@@ -96,10 +96,11 @@ func (s *Server) channel(w http.ResponseWriter, r *http.Request) {
 			switch v.Type {
 			case "heartbeat":
 				var data struct {
-					Doctor    map[string]any      `json:"doctor"`
-					Telemetry map[string]any      `json:"telemetry"`
-					Instances []capacity.Instance `json:"instances"`
-					Logs      map[string]string   `json:"logs"`
+					Doctor         map[string]any      `json:"doctor"`
+					Telemetry      map[string]any      `json:"telemetry"`
+					Instances      []capacity.Instance `json:"instances"`
+					Logs           map[string]string   `json:"logs"`
+					InterruptingAt int64               `json:"interrupting_at"`
 				}
 				if json.Unmarshal(v.Data, &data) != nil {
 					return
@@ -107,10 +108,28 @@ func (s *Server) channel(w http.ResponseWriter, r *http.Request) {
 				m.LastSeen = time.Now().Unix()
 				m.Doctor = data.Doctor
 				m.Telemetry = data.Telemetry
-				if m.State != "draining" {
+				idle := true
+				for _, instance := range data.Instances {
+					if instance.State == "busy" || instance.State == "provisioning" || instance.State == "cleaning" {
+						idle = false
+						break
+					}
+				}
+				if idle {
+					if m.IdleSince == 0 {
+						m.IdleSince = m.LastSeen
+					}
+				} else {
+					m.IdleSince = 0
+				}
+				if data.InterruptingAt > 0 {
+					m.InterruptingAt = data.InterruptingAt
+					m.State = "draining"
+					s.alert("spot-interruption:"+id, "Interrupção Spot anunciada", m.Name)
+				} else if m.State != "draining" && m.State != "revoked" && m.State != "terminated" && m.State != "terminating" {
 					m.State = "online"
 				}
-				s.Store.DB.Exec(`UPDATE resources SET data=json_set(data,'$.last_seen',?,'$.doctor',json(?),'$.telemetry',json(?),'$.state',CASE WHEN json_extract(data,'$.state') IN ('draining','revoked') THEN json_extract(data,'$.state') ELSE 'online' END),updated=? WHERE kind='machine' AND id=?`, m.LastSeen, store.JSON(m.Doctor), store.JSON(m.Telemetry), time.Now().Unix(), id)
+				s.Store.Put("machine", id, m)
 				s.Store.Read("machine", id, &m)
 				if m.State == "revoked" {
 					return
@@ -123,6 +142,13 @@ func (s *Server) channel(w http.ResponseWriter, r *http.Request) {
 					switch v.State {
 					case "idle", "busy", "cleaning", "cleaned", "provisioning":
 						capacity.Update(s.Store, v.ID, v.State, v.Error)
+					}
+				}
+				if data.InterruptingAt > 0 {
+					for _, instance := range data.Instances {
+						if instance.State == "idle" {
+							drainOnce(s.Store, id, instance.ID)
+						}
 					}
 				}
 				for instance, log := range data.Logs {

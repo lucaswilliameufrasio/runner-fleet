@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -30,9 +31,10 @@ import (
 )
 
 type Config struct {
-	ID       string `json:"id"`
-	URL      string `json:"url"`
-	StateDir string `json:"-"`
+	ID              string `json:"id"`
+	URL             string `json:"url"`
+	CloudInstanceID string `json:"cloud_instance_id,omitempty"`
+	StateDir        string `json:"-"`
 }
 type Local struct {
 	Instance      capacity.Instance `json:"instance"`
@@ -111,7 +113,7 @@ func csr(dir string) (string, error) {
 	b, e = x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "enrolling"}}, key)
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: b})), e
 }
-func Enroll(ctx context.Context, dir, server, name, code string) error {
+func Enroll(ctx context.Context, dir, server, name, code, cloudInstanceID string) error {
 	if !strings.HasPrefix(server, "https://") {
 		return errors.New("HTTPS required")
 	}
@@ -125,7 +127,7 @@ func Enroll(ctx context.Context, dir, server, name, code string) error {
 	if e != nil {
 		return e
 	}
-	b, _ := json.Marshal(map[string]any{"code": strings.TrimSpace(code), "csr": request, "name": name, "arch": runtime.GOARCH})
+	b, _ := json.Marshal(map[string]any{"code": strings.TrimSpace(code), "csr": request, "name": name, "arch": runtime.GOARCH, "cloud_instance_id": cloudInstanceID})
 	req, _ := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(server, "/")+"/api/enroll", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	cl := &http.Client{Timeout: 30 * time.Second}
@@ -138,10 +140,11 @@ func Enroll(ctx context.Context, dir, server, name, code string) error {
 		return fmt.Errorf("enrollment HTTP %d", res.StatusCode)
 	}
 	var v struct {
-		ID   string `json:"id"`
-		Cert string `json:"cert"`
-		CA   string `json:"ca"`
-		URL  string `json:"agent_url"`
+		ID              string `json:"id"`
+		Cert            string `json:"cert"`
+		CA              string `json:"ca"`
+		URL             string `json:"agent_url"`
+		CloudInstanceID string `json:"cloud_instance_id"`
 	}
 	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&v); e != nil {
 		return e
@@ -149,7 +152,7 @@ func Enroll(ctx context.Context, dir, server, name, code string) error {
 	if !strings.HasPrefix(v.URL, "wss://") {
 		return errors.New("secure agent URL required")
 	}
-	files := []struct{ name, data string }{{"client.pem", v.Cert}, {"ca.pem", v.CA}, {"config.json", store.JSON(Config{ID: v.ID, URL: v.URL})}}
+	files := []struct{ name, data string }{{"client.pem", v.Cert}, {"ca.pem", v.CA}, {"config.json", store.JSON(Config{ID: v.ID, URL: v.URL, CloudInstanceID: v.CloudInstanceID})}}
 	for _, file := range files {
 		if e = os.WriteFile(filepath.Join(dir, file.name+".tmp"), []byte(file.data), 0600); e != nil {
 			return e
@@ -208,6 +211,63 @@ func Doctor() map[string]any {
 	return v
 }
 func text(v any) string { x, _ := v.(string); return x }
+
+var imdsClient = &http.Client{
+	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout: 1 * time.Second,
+		}).DialContext,
+	},
+}
+
+func spotInterruptionAt(ctx context.Context, client *http.Client, endpoint string) int64 {
+	if client == nil || !strings.HasPrefix(endpoint, "http://") {
+		return 0
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	tokenRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPut, endpoint+"/latest/api/token", nil)
+	if err != nil {
+		return 0
+	}
+	tokenRequest.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
+	tokenResponse, err := client.Do(tokenRequest)
+	if err != nil {
+		return 0
+	}
+	tokenBytes, readErr := io.ReadAll(io.LimitReader(tokenResponse.Body, 4096))
+	tokenResponse.Body.Close()
+	if readErr != nil || tokenResponse.StatusCode != http.StatusOK || len(tokenBytes) == 0 {
+		return 0
+	}
+	spotRequest, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint+"/latest/meta-data/spot/instance-action", nil)
+	if err != nil {
+		return 0
+	}
+	spotRequest.Header.Set("X-aws-ec2-metadata-token", string(tokenBytes))
+	spotResponse, err := client.Do(spotRequest)
+	if err != nil {
+		return 0
+	}
+	defer spotResponse.Body.Close()
+	if spotResponse.StatusCode != http.StatusOK {
+		return 0
+	}
+	var notice struct {
+		Time string `json:"time"`
+	}
+	if json.NewDecoder(io.LimitReader(spotResponse.Body, 4096)).Decode(&notice) != nil {
+		return 0
+	}
+	interruptionTime, err := time.Parse(time.RFC3339, notice.Time)
+	if err != nil {
+		return 0
+	}
+	return interruptionTime.Unix()
+}
+
 func (a *Agent) telemetry() map[string]any {
 	v := map[string]any{"cpu_count": runtime.NumCPU()}
 	b, _ := os.ReadFile("/proc/meminfo")
@@ -320,8 +380,12 @@ func (a *Agent) connect(ctx context.Context) error {
 			}
 		}
 		a.mu.Unlock()
+		interruptingAt := int64(0)
+		if a.Cfg.CloudInstanceID != "" {
+			interruptingAt = spotInterruptionAt(connCtx, imdsClient, "http://169.254.169.254")
+		}
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		return conn.WriteJSON(map[string]any{"type": "heartbeat", "data": map[string]any{"doctor": doctor, "telemetry": a.telemetry(), "instances": instances, "logs": logs}})
+		return conn.WriteJSON(map[string]any{"type": "heartbeat", "data": map[string]any{"doctor": doctor, "telemetry": a.telemetry(), "instances": instances, "logs": logs, "interrupting_at": interruptingAt}})
 	}
 	if e = sendHeartbeat(); e != nil {
 		return e

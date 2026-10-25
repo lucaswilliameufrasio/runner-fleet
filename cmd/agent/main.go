@@ -23,6 +23,7 @@ func main() {
 	server := flag.String("server", "", "public server HTTPS URL")
 	name := flag.String("name", "", "machine name")
 	codeFile := flag.String("code-file", "", "enrollment code file (never pass code in arguments)")
+	cloudInstanceID := flag.String("cloud-instance-id", os.Getenv("RF_CLOUD_INSTANCE_ID"), "EC2 instance ID for cloud enrollment")
 	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -37,7 +38,7 @@ func main() {
 		if *name == "" {
 			*name, _ = os.Hostname()
 		}
-		if e = agent.Enroll(ctx, *dir, *server, *name, string(b)); e != nil {
+		if e = agent.Enroll(ctx, *dir, *server, *name, string(b), *cloudInstanceID); e != nil {
 			log.Fatal(e)
 		}
 		fmt.Println("machine enrolled")

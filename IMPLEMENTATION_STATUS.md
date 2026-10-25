@@ -4,7 +4,7 @@ Pacote: Runner Fleet 0.1.0. Código implementado e binários Linux x64/ARM64 ger
 
 ## Evidência local
 
-- 20 testes Go em 8 arquivos: autenticação/setup/CSRF/recuperação; TOTP e criptografia; CA/CSR; mTLS real em servidor TLS de teste; revogação; consumo único do cadastro; webhooks assinados/deduplicados; jobs monotônicos; inventário pela API com fixture HTTP; tokens de instalação isolados/cacheados; reservas concorrentes; orçamento global; horários; agente idempotente e estado recuperável; backup online e restauração com senha errada/corrupção; SSH privado; CSP de bootstrap da SPA; falha de Docker sem liberar capacidade.
+- Testes Go cobrem autenticação/setup/CSRF/recuperação; TOTP e criptografia; CA/CSR; mTLS em servidor TLS de teste; revogação e enrollment single-use; webhooks; scheduler/reservas concorrentes; agente idempotente e recuperação; backups; SSH; validação Spot, adapter EC2 fake, bootstrap IMDSv2 e vínculo do enrollment ao instance ID; falha de Docker sem liberar capacidade.
 - `go test ./...`, `go test -race ./...`, `go vet ./...`: executados; resultado final registrado em `docs/VALIDATION.txt`.
 - `npm run check`: zero erros/avisos; build SvelteKit estático concluído.
 - Cross-compile de servidor e agente Linux amd64/arm64; manifestos SHA256 assinados Ed25519 e verificados.
@@ -21,6 +21,7 @@ Pacote: Runner Fleet 0.1.0. Código implementado e binários Linux x64/ARM64 ger
 | 3 — execução | Pools/reservas/horários, runner efêmero, sidecar Docker opt-in, reconciliação, drain | Workloads/canários e falhas reais na infraestrutura |
 | 4 — migração | Patch validado/preview/SHA/PR, métricas e estimativa | PR e canário em repo autorizado |
 | 5 — operação | Backups/retention/restore, alertas, auditoria/export, updates e deploy | S3/R2/Discord real, update de máquina e restore do recovery kit |
+| 6 — AWS Spot | Configuração Spot por pool; adapter EC2; launches persistidos/idempotentes; enrollment vinculado; scale-out/idle scale-in; fallback On-Demand explícito; detecção IMDSv2 e drain | IAM/AMI/subnets reais, Spot capacity/fallback, canário de interrupção e comportamento de cobrança |
 
 ## Limitações explícitas
 
@@ -34,5 +35,6 @@ Pacote: Runner Fleet 0.1.0. Código implementado e binários Linux x64/ARM64 ger
 8. Segurança de logs é best-effort; logs de Actions podem conter dados colocados pelo próprio workflow. Repositórios públicos/forks não são ativados automaticamente.
 9. Single-admin e SQLite single-server na V1. Multiusuário/RBAC, HA, API/MCP, novos sistemas operacionais e isolamento por VM ficam no roadmap aprovado.
 10. Não existe API para escolher a máquina que receberá um job específico; o GitHub atribui jobs compatíveis. Label padrão hospedada não é garantia de substituição/economia.
+11. Spot foi testado localmente apenas contra EC2 fake. Não foi feita chamada AWS; credenciais/permissões, custo, disponibilidade, scripts de bootstrap e interrupção real ainda exigem o canário autorizado em `docs/CANARY.md`.
 
 A implementação entregue não deve ser descrita como homologada em produção. Complete o canário na infraestrutura alvo antes de usar para builds sensíveis.

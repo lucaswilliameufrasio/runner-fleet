@@ -199,11 +199,7 @@ func (s *Server) schedule(ctx context.Context) {
 		if counts[p.ID] >= target || orgCounts[org] >= orgMax {
 			continue
 		}
-		for _, id := range p.Machines {
-			var m capacity.Machine
-			if s.Store.Read("machine", id, &m) != nil {
-				continue
-			}
+		for _, m := range eligibleMachines(s.Store, p) {
 			v, e := capacity.Reserve(s.Store, p, m, time.Now())
 			if e != nil {
 				continue
@@ -239,6 +235,7 @@ func (s *Server) schedule(ctx context.Context) {
 			break
 		}
 	}
+	s.reconcileSpot(ctx)
 }
 func githubScope(p capacity.Pool) (string, error) {
 	if p.Scope == "org" {
@@ -253,7 +250,7 @@ func (s *Server) reconcile(ctx context.Context) {
 	for _, b := range machines {
 		var m capacity.Machine
 		json.Unmarshal(b, &m)
-		if m.State == "revoked" {
+		if m.State == "revoked" || m.State == "terminated" || m.State == "terminating" {
 			continue
 		}
 		if time.Now().Unix()-m.LastSeen > 60 && m.State != "draining" && m.State != "enrolling" {

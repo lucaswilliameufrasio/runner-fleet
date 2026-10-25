@@ -29,7 +29,11 @@ install -m 600 -o fleet-agent -g fleet-agent "$RF_CODE_FILE" /var/lib/runner-fle
 loginctl enable-linger fleet-agent
 systemctl start "user@$uid.service"
 if [ ! -f /var/lib/runner-fleet-agent/config.json ]; then
- runuser -u fleet-agent -- /opt/runner-fleet-agent/agent enroll --state /var/lib/runner-fleet-agent --server "$RF_SERVER" --name "${RF_NAME:-$(hostname)}" --code-file /var/lib/runner-fleet-agent/.enrollment-code
+ if [ -n "${RF_CLOUD_INSTANCE_ID:-}" ]; then
+  runuser -u fleet-agent -- /opt/runner-fleet-agent/agent enroll --state /var/lib/runner-fleet-agent --server "$RF_SERVER" --name "${RF_NAME:-$(hostname)}" --code-file /var/lib/runner-fleet-agent/.enrollment-code --cloud-instance-id "$RF_CLOUD_INSTANCE_ID"
+ else
+  runuser -u fleet-agent -- /opt/runner-fleet-agent/agent enroll --state /var/lib/runner-fleet-agent --server "$RF_SERVER" --name "${RF_NAME:-$(hostname)}" --code-file /var/lib/runner-fleet-agent/.enrollment-code
+ fi
 fi
 rm -f /var/lib/runner-fleet-agent/.enrollment-code
 cat > /etc/systemd/system/runner-fleet-agent.service <<UNIT

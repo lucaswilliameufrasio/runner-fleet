@@ -12,44 +12,68 @@ import (
 )
 
 type Machine struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Arch      string         `json:"arch"`
-	State     string         `json:"state"`
-	Serials   []string       `json:"serials"`
-	LastSeen  int64          `json:"last_seen"`
-	MaxSlots  int            `json:"max_slots"`
-	CPU       float64        `json:"cpu"`
-	MemoryMB  int64          `json:"memory_mb"`
-	DiskMB    int64          `json:"disk_mb"`
-	Shared    bool           `json:"shared"`
-	Doctor    map[string]any `json:"doctor"`
-	Telemetry map[string]any `json:"telemetry"`
-	Timezone  string         `json:"timezone"`
-	StartHour int            `json:"start_hour"`
-	EndHour   int            `json:"end_hour"`
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	Arch            string         `json:"arch"`
+	State           string         `json:"state"`
+	Serials         []string       `json:"serials"`
+	LastSeen        int64          `json:"last_seen"`
+	MaxSlots        int            `json:"max_slots"`
+	CPU             float64        `json:"cpu"`
+	MemoryMB        int64          `json:"memory_mb"`
+	DiskMB          int64          `json:"disk_mb"`
+	Shared          bool           `json:"shared"`
+	Doctor          map[string]any `json:"doctor"`
+	Telemetry       map[string]any `json:"telemetry"`
+	Timezone        string         `json:"timezone"`
+	StartHour       int            `json:"start_hour"`
+	EndHour         int            `json:"end_hour"`
+	CloudProvider   string         `json:"cloud_provider,omitempty"`
+	CloudInstanceID string         `json:"cloud_instance_id,omitempty"`
+	CloudMarket     string         `json:"cloud_market,omitempty"`
+	CloudRegion     string         `json:"cloud_region,omitempty"`
+	ProviderPool    string         `json:"provider_pool,omitempty"`
+	InstanceType    string         `json:"instance_type,omitempty"`
+	InterruptingAt  int64          `json:"interrupting_at,omitempty"`
+	IdleSince       int64          `json:"idle_since,omitempty"`
 }
 type Pool struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`
-	Installation  int64    `json:"installation"`
-	Scope         string   `json:"scope"`
-	Target        string   `json:"target"`
-	Group         string   `json:"group"`
-	Labels        []string `json:"labels"`
-	Arch          string   `json:"arch"`
-	Image         string   `json:"image"`
-	Machines      []string `json:"machines"`
-	Min           int      `json:"min"`
-	Max           int      `json:"max"`
-	Weight        int      `json:"weight"`
-	CPU           float64  `json:"cpu"`
-	MemoryMB      int64    `json:"memory_mb"`
-	DiskMB        int64    `json:"disk_mb"`
-	Enabled       bool     `json:"enabled"`
-	Trusted       bool     `json:"trusted"`
-	DockerSidecar bool     `json:"docker_sidecar"`
-	DockerImage   string   `json:"docker_image"`
+	ID            string      `json:"id"`
+	Name          string      `json:"name"`
+	Installation  int64       `json:"installation"`
+	Scope         string      `json:"scope"`
+	Target        string      `json:"target"`
+	Group         string      `json:"group"`
+	Labels        []string    `json:"labels"`
+	Arch          string      `json:"arch"`
+	Image         string      `json:"image"`
+	Machines      []string    `json:"machines"`
+	Min           int         `json:"min"`
+	Max           int         `json:"max"`
+	Weight        int         `json:"weight"`
+	CPU           float64     `json:"cpu"`
+	MemoryMB      int64       `json:"memory_mb"`
+	DiskMB        int64       `json:"disk_mb"`
+	Enabled       bool        `json:"enabled"`
+	Trusted       bool        `json:"trusted"`
+	DockerSidecar bool        `json:"docker_sidecar"`
+	DockerImage   string      `json:"docker_image"`
+	Spot          *SpotConfig `json:"spot,omitempty"`
+}
+type SpotConfig struct {
+	Region                string   `json:"region"`
+	ImageID               string   `json:"image_id"`
+	ImageMode             string   `json:"image_mode"`
+	SubnetIDs             []string `json:"subnet_ids"`
+	SecurityGroupIDs      []string `json:"security_group_ids"`
+	InstanceProfile       string   `json:"instance_profile,omitempty"`
+	SpotInstanceTypes     []string `json:"spot_instance_types"`
+	OnDemandInstanceTypes []string `json:"on_demand_instance_types,omitempty"`
+	SlotsPerMachine       int      `json:"slots_per_machine"`
+	MaxMachines           int      `json:"max_machines"`
+	IdleMinutes           int      `json:"idle_minutes"`
+	RootVolumeGiB         int      `json:"root_volume_gib"`
+	FallbackAfterSeconds  int      `json:"fallback_after_seconds"`
 }
 type Instance struct {
 	ID       string  `json:"id"`
@@ -93,8 +117,16 @@ func Validate(p Pool) error {
 	if p.Scope == "repo" && p.Group != "" {
 		return errors.New("repository runners do not use organization runner groups")
 	}
-	if p.Installation < 1 || p.Name == "" || p.Max < 1 || p.Max > 100 || p.Min < 0 || p.Min > p.Max || p.CPU <= 0 || p.MemoryMB < 256 || p.DiskMB < 512 || len(p.Machines) == 0 || len(p.Labels) == 0 {
+	if p.Installation < 1 || p.Name == "" || p.Max < 1 || p.Max > 100 || p.Min < 0 || p.Min > p.Max || p.CPU <= 0 || p.MemoryMB < 256 || p.DiskMB < 512 || len(p.Machines) == 0 && p.Spot == nil || len(p.Labels) == 0 {
 		return errors.New("pool: invalid limits or missing fields")
+	}
+	if p.Spot != nil {
+		if err := ValidateSpot(*p.Spot); err != nil {
+			return err
+		}
+		if p.Spot.MaxMachines*p.Spot.SlotsPerMachine < p.Min {
+			return errors.New("spot: maximum cloud capacity is below pool minimum")
+		}
 	}
 	if p.Arch != "amd64" && p.Arch != "arm64" {
 		return errors.New("unsupported architecture")
@@ -114,6 +146,116 @@ func Validate(p Pool) error {
 		}
 	}
 	return nil
+}
+
+func ValidateSpot(v SpotConfig) error {
+	if !validRegion(v.Region) || !validAMI(v.ImageID) {
+		return errors.New("spot: invalid region or AMI")
+	}
+	if v.ImageMode != "bootstrap" && v.ImageMode != "prebaked" {
+		return errors.New("spot: image mode must be bootstrap or prebaked")
+	}
+	if len(v.SubnetIDs) == 0 || len(v.SubnetIDs) > 16 || len(v.SecurityGroupIDs) == 0 || len(v.SecurityGroupIDs) > 16 {
+		return errors.New("spot: at least one subnet and security group are required")
+	}
+	for _, id := range v.SubnetIDs {
+		if !validAWSID(id, "subnet-") {
+			return errors.New("spot: invalid subnet id")
+		}
+	}
+	for _, id := range v.SecurityGroupIDs {
+		if !validAWSID(id, "sg-") {
+			return errors.New("spot: invalid security group id")
+		}
+	}
+	if v.InstanceProfile != "" && len(v.InstanceProfile) > 128 {
+		return errors.New("spot: invalid instance profile name")
+	}
+	if len(v.SpotInstanceTypes) == 0 || len(v.SpotInstanceTypes) > 32 {
+		return errors.New("spot: select one or more instance types")
+	}
+	for _, instanceType := range v.SpotInstanceTypes {
+		if !validInstanceType(instanceType) {
+			return errors.New("spot: invalid Spot instance type")
+		}
+	}
+	if len(v.OnDemandInstanceTypes) > 32 {
+		return errors.New("spot: too many On-Demand fallback types")
+	}
+	for _, instanceType := range v.OnDemandInstanceTypes {
+		if !validInstanceType(instanceType) {
+			return errors.New("spot: invalid On-Demand fallback type")
+		}
+	}
+	if v.FallbackAfterSeconds > 0 && len(v.OnDemandInstanceTypes) == 0 || v.FallbackAfterSeconds == 0 && len(v.OnDemandInstanceTypes) > 0 {
+		return errors.New("spot: configure both On-Demand types and a fallback delay, or neither")
+	}
+	if v.SlotsPerMachine < 1 || v.SlotsPerMachine > 32 || v.MaxMachines < 1 || v.MaxMachines > 100 || v.IdleMinutes < 1 || v.IdleMinutes > 1440 || v.RootVolumeGiB < 20 || v.RootVolumeGiB > 2048 || v.FallbackAfterSeconds < 0 || v.FallbackAfterSeconds > 3600 {
+		return errors.New("spot: invalid capacity, idle, volume, or fallback limits")
+	}
+	return nil
+}
+
+func validRegion(value string) bool {
+	if len(value) < 6 || len(value) > 32 {
+		return false
+	}
+	parts := strings.Split(value, "-")
+	if len(parts) < 3 || len(parts[0]) != 2 || parts[len(parts)-1] == "" {
+		return false
+	}
+	for _, char := range parts[0] {
+		if char < 'a' || char > 'z' {
+			return false
+		}
+	}
+	for _, char := range parts[len(parts)-1] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	for _, part := range parts[1 : len(parts)-1] {
+		if part == "" {
+			return false
+		}
+		for _, char := range part {
+			if char < 'a' || char > 'z' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validAMI(value string) bool {
+	return validAWSID(value, "ami-")
+}
+
+func validAWSID(value, prefix string) bool {
+	if !strings.HasPrefix(value, prefix) || len(value) < len(prefix)+8 || len(value) > len(prefix)+17 {
+		return false
+	}
+	for _, char := range value[len(prefix):] {
+		if char < '0' || char > '9' {
+			if char < 'a' || char > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validInstanceType(value string) bool {
+	if len(value) < 4 || len(value) > 32 {
+		return false
+	}
+	for _, char := range value {
+		if char == '.' || char == '-' || char >= '0' && char <= '9' || char >= 'a' && char <= 'z' {
+			continue
+		}
+		return false
+	}
+	return strings.Contains(value, ".")
 }
 func Active(s string) bool { return s != "removed" && s != "failed" }
 func List(s *store.Store) ([]Instance, error) {

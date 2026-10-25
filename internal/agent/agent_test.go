@@ -2,13 +2,61 @@ package agent
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runnerfleet/internal/capacity"
 	"runnerfleet/internal/store"
 	"strings"
 	"testing"
+	"time"
 )
+
+type metadataRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f metadataRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestSpotInterruptionIMDSv2(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: metadataRoundTripper(func(request *http.Request) (*http.Response, error) {
+		requests++
+		if request.URL.Path == "/latest/api/token" {
+			if request.Method != http.MethodPut || request.Header.Get("X-aws-ec2-metadata-token-ttl-seconds") != "60" {
+				t.Fatalf("invalid IMDSv2 token request: %s %s", request.Method, request.URL.Path)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("token")), Header: make(http.Header)}, nil
+		}
+		if request.Method != http.MethodGet || request.Header.Get("X-aws-ec2-metadata-token") != "token" {
+			t.Fatalf("invalid interruption metadata request: %s %s", request.Method, request.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"action":"terminate","time":"2026-10-24T12:34:56Z"}`)), Header: make(http.Header)}, nil
+	})}
+	at := spotInterruptionAt(context.Background(), client, "http://169.254.169.254")
+	want := time.Date(2026, 10, 24, 12, 34, 56, 0, time.UTC).Unix()
+	if at != want || requests != 2 {
+		t.Fatalf("interruption timestamp=%d requests=%d; want %d and 2 requests", at, requests, want)
+	}
+}
+
+func TestSpotInterruptionIgnoresMissingOrMalformedNotice(t *testing.T) {
+	for _, response := range []struct {
+		status int
+		body   string
+	}{{http.StatusNotFound, ""}, {http.StatusOK, `{"time":"not-a-time"}`}} {
+		client := &http.Client{Transport: metadataRoundTripper(func(request *http.Request) (*http.Response, error) {
+			if request.Method == http.MethodPut {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("token")), Header: make(http.Header)}, nil
+			}
+			return &http.Response{StatusCode: response.status, Body: io.NopCloser(strings.NewReader(response.body)), Header: make(http.Header)}, nil
+		})}
+		if got := spotInterruptionAt(context.Background(), client, "http://169.254.169.254"); got != 0 {
+			t.Fatalf("unexpected interruption timestamp %d", got)
+		}
+	}
+}
 
 func TestAgentIdempotenceLocalQuotaAndPersistentRecovery(t *testing.T) {
 	dir := t.TempDir()
