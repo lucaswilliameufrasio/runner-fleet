@@ -647,3 +647,82 @@ func TestStaticBootstrapGetsExactCSPHash(t *testing.T) {
 		t.Fatal("bootstrap blocked by CSP", w.Code, w.Header())
 	}
 }
+
+func TestServicePoolScalesIdleRunnersDownToTarget(t *testing.T) {
+	s := testServer(t)
+	service := capacity.Pool{
+		ID: "svc", Name: "Service", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"linux"}, Arch: "amd64", Execution: "service",
+		RunnerVersion: "2.321.0", RunnerSHA256AMD64: strings.Repeat("a", 64), RunnerSHA256ARM64: strings.Repeat("b", 64),
+		Machines: []string{"m"}, Min: 1, Max: 4, CPU: 1, MemoryMB: 512, DiskMB: 1024, Enabled: true, Trusted: true,
+	}
+	container := service
+	container.ID = "box"
+	container.Name = "Container"
+	container.Execution = ""
+	container.Image = "registry.test/runner@sha256:" + strings.Repeat("c", 64)
+	container.Min = 0
+	if err := s.Store.Put("pool", service.ID, service); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.Put("pool", container.ID, container); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(id string, poolID string, updated int64) {
+		t.Helper()
+		instance := capacity.Instance{ID: id, Name: "rf-" + id, Pool: poolID, Machine: "m", State: "idle", CPU: 1, MemoryMB: 512, DiskMB: 1024, Created: updated}
+		body, err := json.Marshal(instance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.Store.DB.Exec(`INSERT INTO instances VALUES(?,?,?,?,?,?)`, id, poolID, "m", "idle", string(body), updated); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().Unix()
+	insert("keep", service.ID, now-20)
+	insert("drop", service.ID, now)
+	insert("box1", container.ID, now)
+	s.schedule(context.Background())
+	s.schedule(context.Background())
+	rows, err := s.Store.DB.Query(`SELECT json_extract(data,'$.instance') FROM commands WHERE kind='drain' AND state='pending'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "drop" {
+		t.Fatalf("service scale-in drains = %v", got)
+	}
+}
+
+func TestServiceMachineSchedulableWithoutDocker(t *testing.T) {
+	now := time.Now()
+	machine := capacity.Machine{ID: "m", Arch: "amd64", State: "online", LastSeen: now.Unix(), Doctor: map[string]any{"service_ready": true, "ready": false}}
+	pool := capacity.Pool{Arch: "amd64", Execution: "service"}
+	if !machineSchedulable(machine, pool, now) {
+		t.Fatal("dedicated service machine was rejected")
+	}
+	machine.Shared = true
+	if machineSchedulable(machine, pool, now) {
+		t.Fatal("shared service machine without enforcement was accepted")
+	}
+	machine.Doctor["service_enforcement"] = true
+	if !machineSchedulable(machine, pool, now) {
+		t.Fatal("shared service machine with enforcement was rejected")
+	}
+	pool.Execution = ""
+	if machineSchedulable(machine, pool, now) {
+		t.Fatal("container machine without rootless Docker was accepted")
+	}
+}

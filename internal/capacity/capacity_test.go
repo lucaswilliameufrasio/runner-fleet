@@ -131,3 +131,47 @@ func TestSpotPoolValidationAndFallbackPairing(t *testing.T) {
 		t.Fatal("pool minimum greater than cloud capacity accepted")
 	}
 }
+
+func TestServicePoolReservesWithoutDocker(t *testing.T) {
+	s, _, machine := fixture(t)
+	service := Pool{
+		ID: "svc", Name: "Service", Installation: 1, Scope: "repo", Target: "acme/build",
+		Labels: []string{"self-hosted", "linux"}, Arch: "amd64", Execution: "service",
+		RunnerVersion: "2.321.0", RunnerSHA256AMD64: strings.Repeat("a", 64), RunnerSHA256ARM64: strings.Repeat("b", 64),
+		Machines: []string{"m"}, Max: 2, CPU: 1, MemoryMB: 512, DiskMB: 1024, Trusted: true,
+	}
+	if err := Validate(service); err != nil {
+		t.Fatal(err)
+	}
+	machine.Doctor = map[string]any{"service_ready": true, "service_enforcement": true, "ready": false}
+	if _, err := Reserve(s, service, machine, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	machine.Doctor["service_enforcement"] = false
+	if _, err := Reserve(s, service, machine, time.Now()); err == nil {
+		t.Fatal("shared service machine without enforcement reserved")
+	}
+	container := service
+	container.ID = "box"
+	container.Execution = ""
+	container.Image = ""
+	if err := Validate(container); err == nil {
+		t.Fatal("container pool without a digest accepted")
+	}
+	container.Image = "registry.test/runner@sha256:" + strings.Repeat("c", 64)
+	if err := Validate(container); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reserve(s, container, machine, time.Now()); err == nil {
+		t.Fatal("container pool reserved on a machine without rootless Docker")
+	}
+	service.DockerSidecar = true
+	if err := Validate(service); err == nil {
+		t.Fatal("service pool accepted a Docker sidecar")
+	}
+	service.DockerSidecar = false
+	service.RunnerVersion = "2.1"
+	if err := Validate(service); err == nil {
+		t.Fatal("service pool accepted a partial runner version")
+	}
+}

@@ -195,6 +195,7 @@ func (s *Server) schedule(ctx context.Context) {
 			}
 		}
 		target = min(p.Max, max(target, busyCount+queued))
+		scaleInService(s.Store, p, target, instances)
 		org := strings.Split(p.Target, "/")[0]
 		if counts[p.ID] >= target || orgCounts[org] >= orgMax {
 			continue
@@ -237,6 +238,32 @@ func (s *Server) schedule(ctx context.Context) {
 	}
 	s.reconcileSpot(ctx)
 }
+func scaleInService(s *store.Store, pool capacity.Pool, target int, instances []capacity.Instance) {
+	if pool.Execution != "service" {
+		return
+	}
+	active := 0
+	for _, instance := range instances {
+		if instance.Pool == pool.ID && capacity.Active(instance.State) {
+			active++
+		}
+	}
+	excess := active - target
+	if excess < 1 {
+		return
+	}
+	for _, instance := range instances {
+		if excess < 1 {
+			break
+		}
+		if instance.Pool != pool.ID || instance.State != "idle" {
+			continue
+		}
+		drainOnce(s, instance.Machine, instance.ID)
+		excess--
+	}
+}
+
 func githubScope(p capacity.Pool) (string, error) {
 	if p.Scope == "org" {
 		return "/orgs/" + p.Target + "/actions/runners", nil

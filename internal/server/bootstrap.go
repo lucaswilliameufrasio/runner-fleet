@@ -16,12 +16,13 @@ func (s *Server) sshBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var v struct {
-		Host        string `json:"host"`
-		Port        int    `json:"port"`
-		User        string `json:"user"`
-		PrivateKey  string `json:"private_key"`
-		Fingerprint string `json:"fingerprint"`
-		Name        string `json:"name"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		User         string `json:"user"`
+		PrivateKey   string `json:"private_key"`
+		Fingerprint  string `json:"fingerprint"`
+		Name         string `json:"name"`
+		RootPassword string `json:"root_password"`
 	}
 	if !decode(w, r, &v) {
 		return
@@ -37,7 +38,7 @@ func (s *Server) sshBootstrap(w http.ResponseWriter, r *http.Request) {
 	code := security.Random(32)
 	s.Store.DB.Exec(`INSERT INTO enrollment(hash,expires) VALUES(?,?)`, security.Hash(code), time.Now().Add(15*time.Minute).Unix())
 	script := fmt.Sprintf("set -eu\numask 077\nwork=$(mktemp -d)\ntrap 'rm -rf \"$work\"' EXIT\nprintf '%%s' %s > \"$work/code\"\ncurl -fsS --proto '=https' %s -o \"$work/install.sh\"\nRF_SERVER=%s RF_CODE_FILE=\"$work/code\" RF_NAME=%s sh \"$work/install.sh\"\n", shellQuote(code), shellQuote(s.Cfg.Origin+"/downloads/install.sh"), shellQuote(s.Cfg.Origin), shellQuote(v.Name))
-	out, e := bootstrap.Install(r.Context(), bootstrap.Request{Host: v.Host, Port: v.Port, User: v.User, PrivateKey: v.PrivateKey, Fingerprint: v.Fingerprint, Installer: script})
+	out, e := bootstrap.Install(r.Context(), bootstrap.Request{Host: v.Host, Port: v.Port, User: v.User, PrivateKey: v.PrivateKey, Fingerprint: v.Fingerprint, Installer: script, RootPassword: v.RootPassword})
 	s.Store.DB.Exec(`DELETE FROM enrollment WHERE hash=?`, security.Hash(code))
 	if e != nil {
 		s.Store.Audit("admin", "bootstrap.ssh", v.Host, "failed")

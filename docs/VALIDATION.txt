@@ -14,3 +14,12 @@ HTTP artifact smoke passed: SPA assets/CSP, setup, login, CSRF, reauth, enrollme
 Front-end: npm run check (0 errors, 0 warnings) and npm run build passed in release.sh.
 Ed25519 signature and all SHA256SUMS verified.
 Browser E2E not executed successfully: environment blocks Chromium ProcessSingleton Unix socket.
+
+## 2026-11-03 — host prep and persistent service runners
+
+go test -race -count=1 ./... passed.
+go vet ./... passed.
+corepack pnpm run check: 0 errors and 0 warnings.
+corepack pnpm run build wrote web/build. Signed downloads were restored. web/build/downloads/install.sh matches scripts/install.sh.
+
+No GitHub, Docker, VPS, or browser canary was run for this change.

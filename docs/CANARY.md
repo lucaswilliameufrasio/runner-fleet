@@ -8,6 +8,10 @@ Use repositórios de teste antes de ativar produção. Não execute contra orgs 
 - [ ] Enroll por comando e SSH privado, fingerprint divergente recusada, código não reutilizável.
 - [ ] mTLS público na porta 443 via SNI; agente sem certificado/identidade revogada rejeitado.
 - [ ] Rootless Docker/cgroup v2/systemd na distro real; doctor e limites CPU/RAM verificados.
+- [ ] Famílias apt, rpm e zypper: pacotes de runtime instalados, sem upgrade geral e sem sudoers para `fleet-agent` ou `fleet-runner`.
+- [ ] SSH com root, com `sudo -n` e com `su -`; senha ausente do SQLite, da auditoria, do script e das mensagens de erro.
+- [ ] Pool de serviço: versão e checksums oficiais, usuário `fleet-runner` sem sudo e sem grupo `docker`, `config.sh` sem `--ephemeral`, segundo job no mesmo processo, `CPUQuota`/`MemoryMax` e drain só depois que o GitHub marca o runner como livre.
+- [ ] Pool de serviço em máquina sem Docker: doctor `service_ready` permite reserva; pool de container na mesma máquina continua bloqueado.
 - [ ] Build real x64 e ARM64 em máquinas próprias; não inferir sucesso ARM64 a partir de cross-compile.
 - [ ] Perfil base, Node/Bun, Go e Rust; ferramentas e actions de seus workflows.
 - [ ] Docker sidecar dedicado: build, push, container actions, job containers, service containers, volumes/rede, limpeza.

@@ -136,11 +136,17 @@ func machineSchedulable(machine capacity.Machine, pool capacity.Pool, now time.T
 	if machine.State != "online" || machine.Arch != pool.Arch || now.Unix()-machine.LastSeen > 45 {
 		return false
 	}
-	if ready, _ := machine.Doctor["ready"].(bool); !ready {
+	readyKey := "ready"
+	enforcementKey := "enforcement"
+	if pool.Execution == "service" {
+		readyKey = "service_ready"
+		enforcementKey = "service_enforcement"
+	}
+	if ready, _ := machine.Doctor[readyKey].(bool); !ready {
 		return false
 	}
 	if machine.Shared {
-		if enforcement, _ := machine.Doctor["enforcement"].(bool); !enforcement {
+		if enforcement, _ := machine.Doctor[enforcementKey].(bool); !enforcement {
 			return false
 		}
 	}

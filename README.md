@@ -8,7 +8,8 @@ Central self-hosted para inventariar GitHub Actions e administrar runners Linux 
 - GitHub App: instalações, repositórios, YAMLs, matrizes literais, workflows reutilizáveis, histórico/tentativas, runners e grupos com acesso selecionado.
 - Cadastro por comando/SSH privado; certificados individuais; WebSocket mTLS de saída, rotação e revogação.
 - Pools por escopo, budgets globais, pesos, horários e limites por organização. Reservas duráveis incluem runners ociosos.
-- Containers efêmeros, runtime rootless, perfis, Docker isolado opt-in em máquinas dedicadas, reconciliação e drain.
+- Containers efêmeros e runners persistentes no host. O pool escolhe imagem por digest ou o runner oficial como serviço systemd. Docker rootless fica no modo container; sidecar Docker continua opt-in em máquina dedicada. Reconciliação e drain valem para os dois.
+- Capacidade nas máquinas cadastradas e, opcionalmente, workers EC2 Spot. Spot é uma fonte de máquina, não o único tipo de runner.
 - Painel responsivo, histórico, motivos de fila, métricas/estimativas, alertas/webhooks, auditoria, exportação.
 - Dry-run e PR de migração com validação de SHA e alteração restrita de destinos estáticos.
 - Snapshot online SQLite, criptografia Argon2id + AES-GCM, backup local/S3/R2, agendamento, retenção e restore.
@@ -67,7 +68,7 @@ Para orgs, crie um grupo restrito pelo painel selecionando repositórios privado
 
 ## Cadastrar máquinas
 
-A máquina precisa de Linux, HTTPS de saída ao painel/agente/GitHub, systemd, cgroup v2 e Docker rootless. Comece com Ubuntu/Debian. x64 e ARM64 são compilados; homologação local está descrita no status.
+A máquina precisa de Linux com systemd e HTTPS de saída ao painel, ao agente e ao GitHub. O instalador prepara os pacotes de runtime com apt, rpm ou zypper: Debian, Ubuntu, RHEL e derivados, Fedora, Amazon Linux e SUSE. Pool de container também exige cgroup v2 e Docker rootless. Pool de serviço persistente não usa Docker. x64 e ARM64 são compilados; homologação local está descrita no status.
 
 ### Por comando
 
@@ -80,7 +81,7 @@ sudo env RF_SERVER=https://fleet.example.com \
 sudo sh scripts/setup-rootless-docker.sh
 ```
 
-O primeiro script instala agente/serviço; o segundo configura Docker rootless via instalador oficial para `fleet-agent`. Ambos precisam de HTTPS externo. Revise o instalador oficial e políticas de user namespaces/AppArmor da distro. O painel bloqueia execução se o doctor não detectar rootless/cgroup v2/systemd/memory limits. Pode haver configuração específica da distro necessária; não desative AppArmor globalmente para resolver.
+O primeiro script instala os pacotes de runtime, o agente, o usuário `fleet-agent` e o helper root `runner-fleet-service`. Esse helper cria o usuário `fleet-runner`, sem sudo e fora do grupo `docker`, e registra o runner oficial quando o pool é de serviço. O segundo script configura Docker rootless e só é necessário para pools de container. Ambos precisam de HTTPS externo. Revise o instalador oficial e as políticas de user namespaces/AppArmor da distro. O painel aceita pool de container quando o doctor vê rootless, cgroup v2, driver systemd e limite de memória. Aceita pool de serviço quando o helper está ativo. Pode haver configuração específica da distro; não desative AppArmor globalmente para resolver.
 
 Os downloads são verificados por manifesto Ed25519. O primeiro trust anchor vem do HTTPS do servidor; para bootstrap com chave previamente confiada, forneça `RF_RELEASE_PUBLIC_KEY_FILE`. Updates posteriores usam essa chave persistida.
 
@@ -88,7 +89,7 @@ Também pode copiar o binário assinado manualmente, executar `agent enroll` com
 
 ### Por SSH privado
 
-O servidor deve alcançar o IP privado/Tailscale. Não precisa de SSH público. Preencha IP literal, usuário, chave temporária, fingerprint SHA256 confiada e nome. Usuário precisa de `sudo -n`. Credencial fica somente na requisição e não é persistida.
+O servidor deve alcançar o IP privado/Tailscale. Não precisa de SSH público. Preencha IP literal, usuário, chave temporária, fingerprint SHA256 confiada e nome. A sessão pode ser root, ter `sudo -n`, ou usar `su -` com a senha de root. A chave e a senha ficam só na requisição e não são gravadas no SQLite, na auditoria nem no script remoto.
 
 O bootstrap remoto instala o agente a partir dos downloads do painel. Docker rootless deve estar pronto ou ser instalado depois pelo script próprio. Se não existe caminho de rede privado, use o cadastro por comando.
 
@@ -106,19 +107,23 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 Crie perfis Node/Bun, Go, Rust e Docker com `runner/Dockerfile.tools`, `BASE_IMAGE` fixada por digest e `PROFILE=node|go|rust|docker`. Os defaults de versão são explícitos; ajuste conforme seu workflow. Publishe e copie o digest para o pool. Não use `latest` como referência de execução.
 
+### Runner persistente
+
+No pool, escolha execução "serviço". Informe a versão oficial do `actions/runner` e os checksums SHA256 de Linux x64 e ARM64. Não há imagem Docker. O agente pede ao helper root para baixar somente o arquivo publicado em `github.com/actions/runner`, conferir o checksum da arquitetura da máquina e registrar com `config.sh` sem `--ephemeral`. O processo fica no usuário `fleet-runner`. CPU e memória viram `CPUQuota` e `MemoryMax` do systemd. Disco continua orçamento de reserva, não quota rígida. O runner permanece entre jobs. Se a quantidade ociosa passar do mínimo e da fila, o scheduler pede o drain do excedente. O drain espera o GitHub marcar o runner como livre, remove o registro e só então o helper desinstala o serviço. Isso não é fronteira de VM.
+
 ### Workers AWS EC2 Spot
 
 Um pool pode incluir máquinas cadastradas, workers EC2 Spot gerenciados pelo Fleet, ou ambos. O scheduler cria capacidade cloud conforme `min`, jobs compatíveis em fila, `max`, limites globais e slots por máquina; as instâncias sem runners/jobs são encerradas após o período ocioso e drain do runner. Os lançamentos ficam persistidos e reconciliados por client token e tags antes de repetir uma chamada EC2 ambígua.
 
-Na configuração do pool, selecione região, AMI, Ubuntu/Debian com bootstrap ou AMI pré-preparada, subnets, security groups, tipos Spot permitidos, máquinas máximas, slots e volume raiz. Fallback On-Demand fica desligado por padrão; para habilitar, configure uma lista separada de tipos e um atraso. O fallback só ocorre depois de erro AWS conhecido de falta/limite de capacidade Spot, não por erro de autenticação, rede ou configuração. Alterar/ativar a configuração AWS exige reautenticação. Limite o `max` do pool e a IAM policy: fallback On-Demand pode aumentar a tarifa.
+Na configuração do pool, selecione região, AMI, bootstrap apt/rpm/zypper ou AMI pré-preparada, subnets, security groups, tipos Spot permitidos, máquinas máximas, slots e volume raiz. Fallback On-Demand fica desligado por padrão; para habilitar, configure uma lista separada de tipos e um atraso. O fallback só ocorre depois de erro AWS conhecido de falta/limite de capacidade Spot, não por erro de autenticação, rede ou configuração. Alterar/ativar a configuração AWS exige reautenticação. Limite o `max` do pool e a IAM policy: fallback On-Demand pode aumentar a tarifa.
 
-O processo do servidor usa a cadeia padrão de credenciais AWS do SDK (role de instância, web identity, profile/config, conforme o ambiente); chaves não são enviadas ao navegador nem guardadas no SQLite. O operador deve fornecer IAM para `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeImages`, `ec2:DescribeInstanceTypes`, `ec2:TerminateInstances`, `ec2:CreateTags` e `iam:PassRole` apenas para o instance profile escolhido. O Fleet não cria VPC, subnets, security groups, AMIs ou roles. A instância precisa de egress HTTPS ao Fleet e GitHub; modo bootstrap também instala Docker rootless e depende dos repositórios/serviços HTTPS da distro e do instalador oficial.
+O processo do servidor usa a cadeia padrão de credenciais AWS do SDK (role de instância, web identity, profile/config, conforme o ambiente); chaves não são enviadas ao navegador nem guardadas no SQLite. O operador deve fornecer IAM para `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeImages`, `ec2:DescribeInstanceTypes`, `ec2:TerminateInstances`, `ec2:CreateTags` e `iam:PassRole` apenas para o instance profile escolhido. O Fleet não cria VPC, subnets, security groups, AMIs ou roles. A instância precisa de egress HTTPS ao Fleet e GitHub. O modo bootstrap executa o mesmo `install.sh`: pacotes de runtime, agente e helper de serviço. Em seguida instala Docker rootless, necessário para pool de container. Depende dos repositórios da distro e do instalador oficial.
 
-O bootstrap usa um código de enrollment de uso único e curta duração em user-data, valida o instance ID recebido via IMDSv2 contra o lançamento persistido, e elimina o código após enrollment. Restrinja quem pode ler user-data/metadata e não o inclua em logs. A AMI pre-configurada deve ter systemd, cgroup v2 e Docker rootless funcional para `fleet-agent`; o modo bootstrap é para imagens Ubuntu/Debian compatíveis. Tipos EC2 e AMI são verificados contra a arquitetura do pool e a capacidade real de vCPU/memória antes do registro.
+O bootstrap usa um código de enrollment de uso único e curta duração em user-data, valida o instance ID recebido via IMDSv2 contra o lançamento persistido, e elimina o código após enrollment. Restrinja quem pode ler user-data/metadata e não o inclua em logs. A AMI pré-configurada de pool container deve ter systemd, cgroup v2 e Docker rootless funcional para `fleet-agent`. A de pool de serviço deve ter o helper `runner-fleet-service` ativo. O modo bootstrap cobre as famílias apt, rpm e zypper com systemd. Tipos EC2 e AMI são verificados contra a arquitetura do pool e a capacidade real de vCPU/memória antes do registro.
 
 O agente consulta o aviso Spot em IMDSv2, sinaliza a interrupção, impede novas reservas e inicia drain dos runners ociosos. Isso é best-effort: jobs ativos podem ser terminados pela AWS antes de concluir. Reclaim, suspensão do control plane e falhas de rede não têm garantia de preservação/reexecução de jobs. O painel mostra o estado dos launches. Testes locais usam EC2 fake; faça o canário de `docs/CANARY.md` em uma conta/subnets de teste antes de habilitar pools reais.
 
-No painel: configure máquina (slots, CPU, memória, disco, horários), crie pool pausado, selecione instalação/escopo/grupo/labels/imagem/máquinas, reconheça workloads confiáveis e execute canário antes de ativar. CPU e memória são limites reais do container, sujeitos ao suporte cgroups da máquina. Disco é budget de reserva + pressão de espaço livre, não quota rígida de filesystem por job.
+No painel: configure máquina (slots, CPU, memória, disco, horários), crie pool pausado, selecione instalação/escopo/grupo/labels/execução/máquinas, reconheça workloads confiáveis e execute canário antes de ativar. No container, CPU e memória são limites do runtime, sujeitos ao cgroup da máquina. No serviço, são `CPUQuota` e `MemoryMax`. Disco é budget de reserva + pressão de espaço livre, não quota rígida de filesystem por job.
 
 Docker sidecar usa daemon novo por job, volumes exclusivos para workspace/socket e rede compartilhada com o runner. O socket do Docker do host nunca é montado. Exige máquina dedicada, runtime rootless, imagem Docker daemon por digest e pelo menos 2 CPUs/2 GB por slot. Sidecar é privilegiado dentro do runtime rootless: use somente código confiável. Execute build, push, container actions e service containers de canário na sua distro. Não foi homologado neste ambiente sem Docker.
 
@@ -166,4 +171,4 @@ go build -buildvcs=false -o bin/agent ./cmd/agent
 
 Para novas releases, use o secret manager do ambiente para injetar o conteúdo da chave privada Ed25519 em `RF_SIGNING_KEY` ao executar `scripts/release.sh` (não coloque o valor em comandos, arquivos do repositório ou logs). O script materializa a chave em arquivo temporário com permissões restritas e o remove ao terminar. Use a chave já confiada pelas máquinas ou faça rotação manual de confiança. A chave privada da release do pacote não está distribuída.
 
-Veja `docs/ADR.md`, `docs/CANARY.md` e `IMPLEMENTATION_STATUS.md`. Roadmap: múltiplos usuários/RBAC, API/MCP, VM/microVM, distribuições extras e macOS/Windows.
+Veja `docs/ADR.md`, `docs/CANARY.md` e `IMPLEMENTATION_STATUS.md`. O registro continua só no GitHub. Gitea, múltiplos usuários/RBAC, API/MCP, VM/microVM, Alpine, macOS e Windows ficam no roadmap.

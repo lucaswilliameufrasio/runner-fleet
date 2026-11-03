@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"runnerfleet/internal/security"
 	"runnerfleet/internal/store"
 	"strings"
@@ -38,28 +39,38 @@ type Machine struct {
 	IdleSince       int64          `json:"idle_since,omitempty"`
 }
 type Pool struct {
-	ID            string      `json:"id"`
-	Name          string      `json:"name"`
-	Installation  int64       `json:"installation"`
-	Scope         string      `json:"scope"`
-	Target        string      `json:"target"`
-	Group         string      `json:"group"`
-	Labels        []string    `json:"labels"`
-	Arch          string      `json:"arch"`
-	Image         string      `json:"image"`
-	Machines      []string    `json:"machines"`
-	Min           int         `json:"min"`
-	Max           int         `json:"max"`
-	Weight        int         `json:"weight"`
-	CPU           float64     `json:"cpu"`
-	MemoryMB      int64       `json:"memory_mb"`
-	DiskMB        int64       `json:"disk_mb"`
-	Enabled       bool        `json:"enabled"`
-	Trusted       bool        `json:"trusted"`
-	DockerSidecar bool        `json:"docker_sidecar"`
-	DockerImage   string      `json:"docker_image"`
-	Spot          *SpotConfig `json:"spot,omitempty"`
+	ID                string      `json:"id"`
+	Name              string      `json:"name"`
+	Installation      int64       `json:"installation"`
+	Scope             string      `json:"scope"`
+	Target            string      `json:"target"`
+	Group             string      `json:"group"`
+	Labels            []string    `json:"labels"`
+	Arch              string      `json:"arch"`
+	Image             string      `json:"image"`
+	Machines          []string    `json:"machines"`
+	Min               int         `json:"min"`
+	Max               int         `json:"max"`
+	Weight            int         `json:"weight"`
+	CPU               float64     `json:"cpu"`
+	MemoryMB          int64       `json:"memory_mb"`
+	DiskMB            int64       `json:"disk_mb"`
+	Enabled           bool        `json:"enabled"`
+	Trusted           bool        `json:"trusted"`
+	DockerSidecar     bool        `json:"docker_sidecar"`
+	DockerImage       string      `json:"docker_image"`
+	Execution         string      `json:"execution,omitempty"`
+	RunnerVersion     string      `json:"runner_version,omitempty"`
+	RunnerSHA256AMD64 string      `json:"runner_sha256_amd64,omitempty"`
+	RunnerSHA256ARM64 string      `json:"runner_sha256_arm64,omitempty"`
+	Spot              *SpotConfig `json:"spot,omitempty"`
 }
+
+var (
+	runnerVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	runnerSHAPattern     = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+)
+
 type SpotConfig struct {
 	Region                string   `json:"region"`
 	ImageID               string   `json:"image_id"`
@@ -131,10 +142,10 @@ func Validate(p Pool) error {
 	if p.Arch != "amd64" && p.Arch != "arm64" {
 		return errors.New("unsupported architecture")
 	}
-	if !strings.Contains(p.Image, "@sha256:") || len(strings.Split(p.Image, "@sha256:")[1]) != 64 {
-		return errors.New("image must be pinned by sha256 digest")
+	if err := validateExecution(p); err != nil {
+		return err
 	}
-	if p.DockerSidecar && (p.CPU < 2 || p.MemoryMB < 2048 || !strings.Contains(p.DockerImage, "@sha256:")) {
+	if p.Execution != "service" && p.DockerSidecar && (p.CPU < 2 || p.MemoryMB < 2048 || !strings.Contains(p.DockerImage, "@sha256:")) {
 		return errors.New("Docker sidecar needs pinned image, 2+ CPUs and 2048+ MB")
 	}
 	if !p.Trusted {
@@ -146,6 +157,33 @@ func Validate(p Pool) error {
 		}
 	}
 	return nil
+}
+
+func validateExecution(p Pool) error {
+	switch p.Execution {
+	case "", "container":
+		if !pinnedDigest(p.Image) {
+			return errors.New("image must be pinned by sha256 digest")
+		}
+		return nil
+	case "service":
+		if p.DockerSidecar {
+			return errors.New("service runners cannot use a Docker sidecar")
+		}
+		if !runnerVersionPattern.MatchString(p.RunnerVersion) || !runnerSHAPattern.MatchString(p.RunnerSHA256AMD64) || !runnerSHAPattern.MatchString(p.RunnerSHA256ARM64) {
+			return errors.New("service pool requires a runner version and both architecture checksums")
+		}
+		return nil
+	default:
+		return errors.New("pool execution must be container or service")
+	}
+}
+
+func pinnedDigest(image string) bool {
+	if !strings.Contains(image, "@sha256:") {
+		return false
+	}
+	return len(strings.Split(image, "@sha256:")[1]) == 64
 }
 
 func ValidateSpot(v SpotConfig) error {
@@ -257,6 +295,29 @@ func validInstanceType(value string) bool {
 	}
 	return strings.Contains(value, ".")
 }
+func doctorAllows(p Pool, m Machine) error {
+	if p.Execution == "service" {
+		if ok, _ := m.Doctor["service_ready"].(bool); !ok {
+			return errors.New("doctor not ready")
+		}
+		if m.Shared {
+			if ok, _ := m.Doctor["service_enforcement"].(bool); !ok {
+				return errors.New("resource enforcement unavailable")
+			}
+		}
+		return nil
+	}
+	if ok, _ := m.Doctor["ready"].(bool); !ok {
+		return errors.New("doctor not ready")
+	}
+	if m.Shared {
+		if ok, _ := m.Doctor["enforcement"].(bool); !ok {
+			return errors.New("resource enforcement unavailable")
+		}
+	}
+	return nil
+}
+
 func Active(s string) bool { return s != "removed" && s != "failed" }
 func List(s *store.Store) ([]Instance, error) {
 	r, e := s.DB.Query(`SELECT data,state FROM instances ORDER BY updated DESC`)
@@ -302,13 +363,8 @@ func Reserve(s *store.Store, p Pool, m Machine, now time.Time) (Instance, error)
 			return v, errors.New("outside schedule")
 		}
 	}
-	if ok, _ := m.Doctor["ready"].(bool); !ok {
-		return v, errors.New("doctor not ready")
-	}
-	if m.Shared {
-		if ok, _ := m.Doctor["enforcement"].(bool); !ok {
-			return v, errors.New("resource enforcement unavailable")
-		}
+	if err := doctorAllows(p, m); err != nil {
+		return v, err
 	}
 	if low, _ := m.Telemetry["pressure"].(bool); low {
 		return v, errors.New("resource pressure")

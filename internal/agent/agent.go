@@ -44,6 +44,7 @@ type Local struct {
 	Draining      bool              `json:"draining"`
 	DockerSidecar bool              `json:"docker_sidecar"`
 	Deadline      int64             `json:"deadline"`
+	Kind          string            `json:"kind,omitempty"`
 }
 type Agent struct {
 	Cfg        Config
@@ -180,16 +181,21 @@ func cmd(ctx context.Context, args ...string) (string, error) {
 }
 func Doctor() map[string]any {
 	v := map[string]any{"arch": runtime.GOARCH, "os": runtime.GOOS, "cpu": runtime.NumCPU(), "ready": false, "enforcement": false}
+	markService(v)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	b, e := cmd(ctx, "docker", "info", "--format", "{{json .}}")
 	if e != nil {
-		v["error"] = "Docker unavailable to agent user"
+		if v["service_ready"] != true {
+			v["error"] = "Docker unavailable to agent user"
+		}
 		return v
 	}
 	var info map[string]any
 	if json.Unmarshal([]byte(b), &info) != nil {
-		v["error"] = "invalid Docker info"
+		if v["service_ready"] != true {
+			v["error"] = "invalid Docker info"
+		}
 		return v
 	}
 	rootless := false
@@ -205,7 +211,7 @@ func Doctor() map[string]any {
 	v["ready"] = rootless && text(info["CgroupVersion"]) == "2" && text(info["CgroupDriver"]) == "systemd" && info["MemoryLimit"] == true
 	v["enforcement"] = v["ready"]
 	v["docker_version"] = info["ServerVersion"]
-	if v["ready"] != true {
+	if v["ready"] != true && v["service_ready"] != true {
 		v["error"] = "rootless Docker + cgroup v2 required"
 	}
 	return v
@@ -551,7 +557,13 @@ func (a *Agent) start(ctx context.Context, command string, spec capacity.Spec) e
 		a.mu.Unlock()
 		return errors.New("Docker sidecar requires dedicated machine")
 	}
-	if a.DoctorData["ready"] != true {
+	serviceMode := spec.Pool.Execution == "service"
+	if serviceMode {
+		if a.DoctorData["service_ready"] != true {
+			a.mu.Unlock()
+			return errors.New("service doctor not ready")
+		}
+	} else if a.DoctorData["ready"] != true {
 		a.mu.Unlock()
 		return errors.New("doctor not ready")
 	}
@@ -559,14 +571,30 @@ func (a *Agent) start(ctx context.Context, command string, spec capacity.Spec) e
 		a.mu.Unlock()
 		return errors.New("invalid runner spec")
 	}
-	local := &Local{Instance: spec.Instance, Image: spec.Pool.Image, Container: "rf-" + spec.Instance.ID, Command: command, Deadline: time.Now().Add(10 * time.Minute).Unix(), DockerSidecar: spec.Pool.DockerSidecar}
-	local.DockerSidecar = spec.Pool.DockerSidecar
+	if serviceMode {
+		if _, requestErr := serviceRequest(spec, runtime.GOARCH); requestErr != nil {
+			a.mu.Unlock()
+			return errors.New("invalid service request")
+		}
+	}
+	kind := "container"
+	if serviceMode {
+		kind = "service"
+	}
+	local := &Local{Instance: spec.Instance, Image: spec.Pool.Image, Container: "rf-" + spec.Instance.ID, Command: command, Deadline: time.Now().Add(serviceStartTimeout).Unix(), DockerSidecar: spec.Pool.DockerSidecar, Kind: kind}
+	if serviceMode {
+		local.Image = ""
+		local.Container = ""
+	}
 	local.Instance.State = "provisioning"
 	a.Instances[spec.Instance.ID] = local
 	e := a.saveLocked()
 	a.mu.Unlock()
 	if e != nil {
 		return e
+	}
+	if serviceMode {
+		return a.startService(ctx, spec)
 	}
 	work := filepath.Join(a.Cfg.StateDir, "bootstrap", spec.Instance.ID)
 	if e = os.MkdirAll(work, 0700); e != nil {
@@ -658,6 +686,10 @@ func (a *Agent) monitor(ctx context.Context) {
 				continue
 			}
 			if v.Instance.State == "cleaned" {
+				continue
+			}
+			if v.Kind == "service" {
+				a.observeService(v)
 				continue
 			}
 			inspectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
