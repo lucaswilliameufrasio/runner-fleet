@@ -16,9 +16,9 @@ Central self-hosted para inventariar GitHub Actions e administrar runners Linux 
 
 Veja `IMPLEMENTATION_STATUS.md` para a evidência e os limites de validação. A compilação ARM64 não equivale à homologação em máquina ARM64. Integrações externas exigem seu canário antes de produção.
 
-## Iniciar com os binários incluídos
+## Iniciar com os binários da release
 
-O pacote inclui `dist/runner-fleet-server-linux-{amd64,arm64}` e agentes correspondentes. Não é necessário Go/Node para executar o servidor. Escolha a arquitetura correta.
+`dist/` está no `.gitignore`. `scripts/release.sh` gera aí o servidor, os agentes e a assinatura. Um clone não traz esses arquivos. Para executar sem compilar, use uma release já gerada e escolha a arquitetura correta.
 
 ```sh
 chmod +x dist/runner-fleet-server-linux-amd64
@@ -49,7 +49,7 @@ docker compose -f deploy/compose.yml up -d
 
 O build requer Docker/BuildKit, acesso aos registries das imagens-base, pacotes npm (via pnpm) e módulos Go; não requer GitHub App, token ou runner do GitHub. O painel fixa pnpm 12.15.0 em `web/package.json` e aprova somente o build do `esbuild` travado no lockfile. `docker compose ... config --quiet` valida a configuração sem subir serviços. O smoke HTTP pode usar `GET /api/health` em instalação local isolada; testes de integração com a API do GitHub continuam usando fixtures/fakes e não validam permissões, rate limits ou webhooks reais.
 
-O build Docker compila o projeto, mas as releases de agentes assinadas precisam ser publicadas em `web/build/downloads`. Nos binários incluídos, esse diretório já está preparado. Para Compose, monte-o conforme o exemplo de volume no arquivo de configuração.
+O build Docker compila o projeto, mas as releases de agentes assinadas precisam ser publicadas em `web/build/downloads`. Esse diretório também está no `.gitignore` e é preenchido pelo `scripts/release.sh`. Para Compose, monte-o conforme o exemplo de volume no arquivo de configuração.
 
 ## Conectar o GitHub
 
