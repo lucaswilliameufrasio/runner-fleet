@@ -11,6 +11,8 @@ Pacote: Runner Fleet 0.1.0. Código implementado e binários Linux x64/ARM64 ger
 - Smoke HTTP com o binário real passou: assets da SPA/CSP, setup, login, CSRF, reautenticação, cadastro, exportação e logout.
 - Teste de ciclo de vida do agente usa fake Docker controlado para verificar idempotência/segredos/quotas. Isso não é execução Docker real.
 
+O [plano de desenvolvimento](docs/PLANO-DESENVOLVIMENTO.md) descreve a direção para máquinas próprias, roteamento e isolamento doméstico; os critérios ali continuam pendentes.
+
 ## Fases
 
 | Fase | Código entregue | Validação externa necessária |
