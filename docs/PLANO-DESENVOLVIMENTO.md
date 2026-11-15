@@ -4,6 +4,8 @@
 
 **Direção:** usar máquinas próprias como capacidade para GitHub Actions, com conexão e operação simples, escolha transparente do destino quando possível e proteção da rede doméstica gerenciada pelo Runner Fleet.
 
+Pesquisa, propostas e decisões abertas da primeira etapa: [estudo técnico de isolamento e roteamento](ESTUDO-ISOLAMENTO-ROTEAMENTO.md).
+
 ## Objetivo e limites
 
 O proprietário conecta máquinas Linux, define quem pode usá-las e acompanha onde cada job executou. Máquinas disponíveis recebem jobs compatíveis; quando não puderem recebê-los, uma alternativa autorizada pode assumir, conforme a capacidade real do GitHub e o contrato do workflow. O comportamento deve ser compreensível para o desenvolvedor que apenas faz push.
@@ -35,7 +37,7 @@ O projeto atual administra pools, runners efêmeros em containers, serviços per
 
 - Criar uma rede de job separada, sem ponte direta para a LAN; impor regras fora da VM, antes de iniciar o runner. Tratar tráfego encaminhado e destinado ao próprio host, incluindo outras interfaces, VMs e serviços de gerenciamento.
 - Negar acesso a LANs e rotas privadas, link-local, gateway doméstico, host, outras VMs e destinos de infraestrutura sensíveis, em IPv4 e IPv6. Tratar rotas sobrepostas, redes VPN, loopback, múltiplas interfaces, mudanças de endereço e nomes que resolvam para destinos proibidos. Não depender somente de DNS ou listas RFC1918.
-- Projetar DNS e egress para manter os bloqueios após resolução e redirecionamentos. Definir, antes da implementação, se o padrão permite internet pública geral ou apenas destinos aprovados, e como atender endpoints dinâmicos de GitHub, registries e pacotes sem falsa segurança. Tráfego para destinos privados continua negado mesmo quando o nome aparenta ser público.
+- Projetar DNS e egress para manter os bloqueios após resolução e redirecionamentos. O padrão permite internet pública geral, mantendo bloqueados rede doméstica e demais destinos protegidos; restrições adicionais ficam a critério do operador. Atender endpoints dinâmicos de GitHub, registries e pacotes sem falsa segurança. Tráfego para destinos privados continua negado mesmo quando o nome aparenta ser público.
 - Isolar o tráfego de gerenciamento do agente do tráfego dos jobs. Não expor credenciais, canal do Fleet ou uma API privilegiada para a VM.
 - Aplicar regras próprias e identificáveis, sem apagar nem substituir regras do usuário. Investigar coexistência com nftables/iptables, Docker, firewalld, ufw, VPNs e políticas existentes; instalação, atualização e remoção não devem alterar regras não pertencentes ao Fleet.
 - Reconstruir e verificar regras após reinício; detectar perda ou alteração de proteção. Bloquear novos runners e definir, implementar e testar a resposta para VMs já ativas. Não afirmar corte instantâneo durante falha total até demonstrá-lo.
@@ -76,7 +78,7 @@ O projeto atual administra pools, runners efêmeros em containers, serviços per
 - `internal/discovery/`, `internal/github/` e ferramentas de migração: inspecionar compatibilidade e permissões reais; propor alterações de workflow revisáveis e manter limites para expressões não resolvidas.
 - `web/`: jornadas distintas para conectar/diagnosticar máquina, configurar acesso e segurança, ordenar destinos, revisar migração e acompanhar atividade. Mostrar estado desconhecido e bloqueios, não selos genéricos de segurança.
 - `scripts/`, `deploy/` e releases: distribuição e verificação dos componentes necessários por arquitetura; instalação e desinstalação reversíveis e de escopo limitado; suporte explícito a famílias de distribuição comprovadas.
-- Atualizar README com propósito, início rápido, requisitos, limites de segurança e links para guias; atualizar ADR, canário e status conforme decisões aceitas e evidência real, preservando o histórico dos modos existentes.
+- Atualizar ADR, canário e status conforme decisões aceitas e evidência real, preservando o histórico dos modos existentes. Deixar a revisão do README para a última etapa do plano.
 
 ## Estados, recuperação e cancelamento
 
@@ -93,6 +95,7 @@ O projeto atual administra pools, runners efêmeros em containers, serviços per
 4. **Roteamento e fallback:** implementar após validar os contratos GitHub; incluir análise de workflows, preview, autorização dos destinos e histórico da decisão.
 5. **Experiência e governança:** pausar/drenar, visibilidade, limites, documentação, política de compartilhamento; entregar RBAC real antes de afirmar controle individual.
 6. **Ampliação de plataforma:** Ubuntu ARM64 em hardware real e CachyOS AMD64; só depois ampliar a matriz publicada. Homologar Docker dentro da VM como funcionalidade separada.
+7. **README, por último:** reescrever com propósito, início rápido, requisitos, limites de segurança e links para guias, refletindo apenas o que foi implementado e comprovado.
 
 ## Critérios de aceitação e evidência exigida
 
@@ -114,7 +117,7 @@ Todos estão **pendentes**; testes artificiais não substituem canário autoriza
 ## Decisões ainda abertas
 
 - Backend de virtualização e modelo de imagens; alternativas, manutenção, limites e suporte a KVM aninhado.
-- Política padrão de saída à internet, exceções aprovadas e compatibilidade com DNS/IPv6 e endpoints dinâmicos.
+- Mecanismo opcional de restrições adicionais de saída, exceções aprovadas e compatibilidade com DNS/IPv6 e endpoints dinâmicos.
 - Resposta operacional a perda de proteção durante job ativo, incluindo disponibilidade, cancelamento e evidência.
 - Arquitetura e contrato do seletor de destino, compatibilidade com organizações e custo do fallback.
 - Identidade, propriedade e RBAC para permitir que pessoas distintas governem suas máquinas.
