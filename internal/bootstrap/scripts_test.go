@@ -22,12 +22,13 @@ func TestInstallScriptEmbedsHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// web/build/downloads is produced by scripts/release.sh and is gitignored.
 	download, err := os.ReadFile(downloadPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(install, download) {
+	if err == nil && !bytes.Equal(install, download) {
 		t.Fatal("published install.sh drifted from scripts/install.sh")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
 	}
 	marker := []byte("<<'RUNNER_FLEET_HELPER'\n")
 	start := bytes.Index(install, marker)
