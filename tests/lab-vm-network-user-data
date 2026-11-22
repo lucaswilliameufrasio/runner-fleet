@@ -1,0 +1,47 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-lab-network-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import socket
+      import threading
+      import time
+      def persistent_probe():
+          attempt = 0
+          while True:
+              attempt += 1
+              try:
+                  with socket.create_connection(("198.51.100.2", 34679), timeout=0.8) as connection:
+                      connection.settimeout(0.8)
+                      while True:
+                          connection.sendall(b"probe")
+                          if connection.recv(5) != b"probe":
+                              raise RuntimeError("Invalid response")
+                          print("FLEET_VM_FLOW_OK=" + str(attempt), flush=True)
+                          time.sleep(0.3)
+              except (OSError, RuntimeError):
+                  print("FLEET_VM_FLOW_CLOSED=" + str(attempt), flush=True)
+                  time.sleep(0.3)
+      threading.Thread(target=persistent_probe, daemon=True).start()
+      print("FLEET_VM_NET_READY", flush=True)
+      for _ in range(120):
+          for name, address, port in (
+              ("HOST", "192.0.2.1", 34680),
+              ("TARGET", "198.51.100.2", 34679),
+          ):
+              try:
+                  with socket.create_connection((address, port), timeout=0.8) as connection:
+                      connection.settimeout(0.8)
+                      connection.sendall(b"probe")
+                      if connection.recv(5) != b"probe":
+                          raise RuntimeError("Invalid response")
+                  print("FLEET_VM_" + name + "=OK", flush=True)
+              except (OSError, RuntimeError):
+                  print("FLEET_VM_" + name + "=DENIED", flush=True)
+          time.sleep(0.3)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-lab-network-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30

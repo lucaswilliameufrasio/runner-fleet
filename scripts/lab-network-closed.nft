@@ -1,0 +1,9 @@
+# Experimental closed state for a disposable namespace only.
+# rflab0 must be exclusively owned by this experiment.
+# "create" rejects an existing table rather than adopting or replacing it.
+create table inet runner_fleet_lab_closed
+add chain inet runner_fleet_lab_closed input_guard { type filter hook input priority -300; policy accept; }
+add chain inet runner_fleet_lab_closed forward_guard { type filter hook forward priority -300; policy accept; }
+add chain inet runner_fleet_lab_closed postrouting { type nat hook postrouting priority srcnat; policy accept; }
+add rule inet runner_fleet_lab_closed input_guard iifname "rflab0" counter drop
+add rule inet runner_fleet_lab_closed forward_guard iifname "rflab0" counter drop

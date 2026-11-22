@@ -1,0 +1,4 @@
+# Namespace experiment only. Close forwarding atomically before removing NAT.
+flush chain inet runner_fleet_lab_closed forward_guard
+flush chain inet runner_fleet_lab_closed postrouting
+add rule inet runner_fleet_lab_closed forward_guard iifname "rflab0" counter drop

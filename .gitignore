@@ -5,3 +5,7 @@
 /web/build/
 *.key
 *.rfbackup
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/session-*.md

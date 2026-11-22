@@ -1,0 +1,57 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-socket-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import socket
+      import struct
+      import time
+      def checksum(data):
+          if len(data) % 2:
+              data += b"\x00"
+          total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+          while total >> 16:
+              total = (total & 0xffff) + (total >> 16)
+          return (~total) & 0xffff
+      def frame(mac, source, destination, port, payload):
+          udp = struct.pack("!HHHH", 23456, port, 8 + len(payload), 0)
+          if ":" in destination:
+              src = socket.inet_pton(socket.AF_INET6, source)
+              dst = socket.inet_pton(socket.AF_INET6, destination)
+              pseudo = src + dst + struct.pack("!I3xB", len(udp) + len(payload), socket.IPPROTO_UDP)
+              csum = checksum(pseudo + udp + payload) or 0xffff
+              udp = udp[:6] + struct.pack("!H", csum)
+              header = struct.pack("!IHBB16s16s", 6 << 28, len(udp) + len(payload), 17, 64, src, dst)
+              protocol = b"\x86\xdd"
+          else:
+              src = socket.inet_aton(source)
+              dst = socket.inet_aton(destination)
+              header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp) + len(payload),
+                                   23, 0, 64, 17, 0, src, dst)
+              header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
+              protocol = b"\x08\x00"
+          return bytes.fromhex(mac) + bytes.fromhex("525400553412") + protocol + header + udp + payload
+      local = "02aabb000010"
+      remote = "02aabb000001"
+      payload = b"fleet-probe"
+      packets = (
+          frame(local, "192.0.2.2", "192.0.2.4", 34683, payload),
+          frame(local, "fd42:1234:5678::2", "fd42:1234:5678::4", 34684, payload),
+          frame(remote, "192.0.2.2", "192.0.2.3", 34681, payload),
+          frame(remote, "fd42:1234:5678::2", "fd42:1234:5678::1", 34682, payload),
+          bytes.fromhex(local + "52540055341288b5") + b"fleet-l2-local",
+          bytes.fromhex(remote + "52540055341288b5") + b"fleet-l2-probe",
+      )
+      with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as raw:
+          raw.bind(("lab0", 0))
+          print("SOCKET_PROBE_READY", flush=True)
+          for _ in range(1200):
+              for packet in packets:
+                  raw.send(packet)
+              time.sleep(0.05)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-socket-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30

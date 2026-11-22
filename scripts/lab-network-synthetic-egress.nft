@@ -1,0 +1,8 @@
+# Namespace experiment only. Exactly one synthetic destination, no IPv6 egress.
+# Apply as one nft transaction only after lab-network-closed.nft is installed.
+flush chain inet runner_fleet_lab_closed forward_guard
+flush chain inet runner_fleet_lab_closed postrouting
+add rule inet runner_fleet_lab_closed forward_guard iifname "rflab0" oifname "rftarget0" ip saddr 192.0.2.2 ip daddr 198.51.100.2 counter accept
+add rule inet runner_fleet_lab_closed forward_guard iifname "rflab0" counter drop
+add rule inet runner_fleet_lab_closed forward_guard iifname "rftarget0" oifname "rflab0" ip saddr 198.51.100.2 ip daddr 192.0.2.2 ct state established,related counter accept
+add rule inet runner_fleet_lab_closed postrouting oifname "rftarget0" ip saddr 192.0.2.2 ip daddr 198.51.100.2 counter snat to 198.51.100.1

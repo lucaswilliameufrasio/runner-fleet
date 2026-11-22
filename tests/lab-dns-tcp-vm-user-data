@@ -1,0 +1,44 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-service-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import os
+      import select
+      import time
+      path = "/dev/virtio-ports/org.runnerfleet.synthetic"
+      for _ in range(120):
+          if os.path.exists(path):
+              break
+          time.sleep(0.25)
+      fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+      print("VM_BROKER_READY", flush=True)
+      for _ in range(100):
+          for command in (b"dns", b"tcp", b"host", b"lan",
+                          b"kernel-host-tcp", b"kernel-lan-tcp",
+                          b"kernel-host-dns", b"kernel-lan-dns",
+                          b"kernel-cross-tcp", b"kernel-cross-dns"):
+              os.write(fd, command + b"\n")
+              response = bytearray()
+              while True:
+                  ready, _, _ = select.select([fd], [], [], 4)
+                  if not ready:
+                      print("VM_BROKER_TIMEOUT", flush=True)
+                      raise SystemExit(1)
+                  part = os.read(fd, 1)
+                  if not part:
+                      print("VM_BROKER_EOF", flush=True)
+                      raise SystemExit(1)
+                  if part == b"\n":
+                      break
+                  response.extend(part)
+                  if len(response) > 1024:
+                      raise RuntimeError("response exceeds test limit")
+              print("VM_RESULT=" + command.decode() + ":" + response.decode(), flush=True)
+          time.sleep(0.3)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-service-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30

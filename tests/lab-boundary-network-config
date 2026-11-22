@@ -1,0 +1,10 @@
+version: 2
+ethernets:
+  lab:
+    match:
+      macaddress: "52:54:00:55:34:12"
+    set-name: lab0
+    addresses: [192.0.2.2/24, "fd42:1234:5678::2/64"]
+    routes:
+      - to: default
+        via: 192.0.2.1

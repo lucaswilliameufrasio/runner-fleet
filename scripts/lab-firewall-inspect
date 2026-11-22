@@ -1,0 +1,8 @@
+#!/bin/sh
+# Installed as root-owned code; never accept a command or firewall arguments.
+set -eu
+if [ "$#" -ne 0 ]; then
+    echo "No arguments are accepted." >&2
+    exit 2
+fi
+exec /usr/sbin/nft list ruleset

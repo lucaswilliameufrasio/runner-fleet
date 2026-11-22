@@ -1,0 +1,64 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-relay-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import socket
+      import struct
+      import threading
+      import time
+      def receive_replies():
+          with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as receiver:
+              receiver.bind(("lab0", 0))
+              print("RELAY_REPLY_LISTENER_READY", flush=True)
+              while True:
+                  frame = receiver.recv(2048)
+                  if (len(frame) >= 42 and frame[12:14] == b"\x08\x00"
+                          and frame[26:30] in (socket.inet_aton("198.51.100.2"),
+                                               socket.inet_aton("203.0.113.2"))
+                          and frame[30:34] == socket.inet_aton("192.0.2.2")
+                          and struct.unpack("!HH", frame[34:38]) == (34690, 23456)
+                          and frame[42:53] == b"fleet-reply" and len(frame) >= 61):
+                      identifier = struct.unpack("!Q", frame[53:61])[0]
+                      print("RELAY_VM_REPLY_OK=" + str(identifier), flush=True)
+                      print("RELAY_VM_SOURCE=" + socket.inet_ntoa(frame[26:30]), flush=True)
+      threading.Thread(target=receive_replies, daemon=True).start()
+      def checksum(data):
+          if len(data) % 2:
+              data += b"\x00"
+          total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+          while total >> 16:
+              total = (total & 0xffff) + (total >> 16)
+          return (~total) & 0xffff
+      def packet(destination, identifier=0, source="192.0.2.2", flags=0, port=34690):
+          payload = b"fleet-allowed" + struct.pack("!Q", identifier)
+          udp = struct.pack("!HHHH", 23456, port, 8 + len(payload), 0)
+          header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp) + len(payload),
+                               23, flags, 64, 17, 0, socket.inet_aton(source), socket.inet_aton(destination))
+          header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
+          return bytes.fromhex("02aabb0000015254005534120800") + header + udp + payload
+      packets = (
+          packet("198.51.100.1"),
+          packet("198.51.100.3"),
+          packet("203.0.113.3"),
+          packet("198.51.100.2", source="192.0.2.99"),
+          packet("198.51.100.2", flags=0x2000),
+          packet("198.51.100.2", port=34691),
+          bytes.fromhex("02aabb00000152540055341286dd") + bytes(40),
+          bytes.fromhex("02aabb00000152540055341288b5") + b"fleet-l2",
+      )
+      with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as raw:
+          raw.bind(("lab0", 0))
+          print("RELAY_PROBE_READY", flush=True)
+          for identifier in range(1, 1001):
+              destination = "198.51.100.2" if identifier % 2 else "203.0.113.2"
+              raw.send(packet(destination, identifier))
+              for item in packets:
+                  raw.send(item)
+              time.sleep(0.3)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-relay-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30

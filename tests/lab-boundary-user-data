@@ -1,0 +1,37 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-boundary-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import socket
+      import time
+      print("BOUNDARY_PROBE_READY", flush=True)
+      for _ in range(120):
+          for name, address, port in (
+              ("SIDE4", "192.0.2.3", 34681),
+              ("SIDE6", "fd42:1234:5678::1", 34682),
+              ("FENCE", "192.0.2.1", 34680),
+          ):
+              try:
+                  with socket.create_connection((address, port), timeout=0.8) as connection:
+                      connection.settimeout(0.8)
+                      connection.sendall(b"probe")
+                      if connection.recv(5) != b"probe":
+                          raise RuntimeError("Invalid response")
+                  print("BOUNDARY_" + name + "=OK", flush=True)
+              except (OSError, RuntimeError):
+                  print("BOUNDARY_" + name + "=DENIED", flush=True)
+          try:
+              with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as raw:
+                  raw.bind(("lab0", 0))
+                  raw.send(bytes.fromhex("02aabb00000152540055341288b5") + b"fleet-l2-probe")
+              print("BOUNDARY_L2=SENT", flush=True)
+          except OSError:
+              print("BOUNDARY_L2=FAILED", flush=True)
+          time.sleep(0.3)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-boundary-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30

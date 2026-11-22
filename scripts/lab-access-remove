@@ -1,0 +1,37 @@
+#!/bin/sh
+# Removes only the two fixed lab access files, after explicit confirmation.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 2 ] || [ "$2" != "--confirm" ]; then
+    echo "Usage: run as root: $0 USER --confirm" >&2
+    exit 2
+fi
+user=$1
+case "$user" in
+    ''|*[!a-z0-9_-]*|-*|[0-9]*)
+        echo "Invalid local username." >&2
+        exit 2
+        ;;
+esac
+helper=/usr/local/sbin/runner-fleet-lab-firewall-inspect
+rule=/etc/sudoers.d/runner-fleet-lab-inspect
+source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+for file in "$rule" "$helper"; do
+    if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+        echo "Unexpected file type at $file; refusing removal." >&2
+        exit 1
+    fi
+done
+if [ -e "$rule" ] && ! printf '%s ALL=(root) NOPASSWD: %s ""\n' "$user" "$helper" | cmp -s - "$rule"; then
+    echo "Sudo rule differs from the expected lab rule; refusing removal." >&2
+    exit 1
+fi
+if [ -e "$helper" ] && ! cmp -s "$source_dir/lab-firewall-inspect" "$helper"; then
+    echo "Helper differs from the reviewed source; refusing removal." >&2
+    exit 1
+fi
+# Revoke sudo access before removing the executable.
+rm -f -- "$rule"
+rm -f -- "$helper"
+echo "Removed the lab inspection access; no accounts or VM resources were removed."

@@ -1,0 +1,7 @@
+# Disposable namespace experiment only. This is NOT a host installation.
+# The separate guard denies guest forwarding unless its bounded lease exists.
+create table inet runner_fleet_lab_lease
+add set inet runner_fleet_lab_lease permits { type ipv4_addr; flags timeout; timeout 3s; }
+add chain inet runner_fleet_lab_lease guard { type filter hook forward priority -310; policy accept; }
+add rule inet runner_fleet_lab_lease guard iifname "rflab0" oifname "rftarget0" ip saddr @permits ip daddr 198.51.100.2 counter return
+add rule inet runner_fleet_lab_lease guard iifname "rflab0" counter drop

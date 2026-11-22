@@ -1,0 +1,76 @@
+#cloud-config
+write_files:
+  - path: /usr/local/sbin/fleet-native-probe
+    permissions: '0700'
+    content: |
+      #!/usr/bin/python3
+      import socket
+      import struct
+      import time
+      question = b"\x07service\x07example\x00\x00\x01\x00\x01"
+      query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+      expected = (b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + question
+                  + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x1e\x00\x04"
+                  + socket.inet_aton("203.0.113.2"))
+      print("NATIVE_PROBE_READY", flush=True)
+      for _ in range(150):
+          try:
+              with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                  s.settimeout(1)
+                  s.connect(("198.51.100.2", 35353))
+                  s.send(query)
+                  if s.recv(512) != expected:
+                      raise RuntimeError("bad DNS response")
+              print("NATIVE_DNS=OK", flush=True)
+          except (OSError, RuntimeError):
+              print("NATIVE_DNS=DENIED", flush=True)
+          try:
+              with socket.create_connection(("198.51.100.3", 38080), timeout=1) as s:
+                  s.settimeout(1)
+                  s.sendall(b"fleet-tcp")
+                  if s.recv(128) != b"fleet-response":
+                      raise RuntimeError("bad TCP response")
+              print("NATIVE_TCP=OK", flush=True)
+          except (OSError, RuntimeError):
+              print("NATIVE_TCP=DENIED", flush=True)
+          try:
+              with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                  s.settimeout(1)
+                  s.connect(("203.0.113.10", 35353))
+                  s.send(query)
+                  if s.recv(512) != expected:
+                      raise RuntimeError("bad DNS response")
+              print("NATIVE_PUBLIC_DNS=OK", flush=True)
+          except (OSError, RuntimeError):
+              print("NATIVE_PUBLIC_DNS=DENIED", flush=True)
+          try:
+              with socket.create_connection(("203.0.113.10", 38080), timeout=1) as s:
+                  s.settimeout(1)
+                  s.sendall(b"fleet-tcp")
+                  if s.recv(128) != b"fleet-response":
+                      raise RuntimeError("bad TCP response")
+              print("NATIVE_PUBLIC_TCP=OK", flush=True)
+          except (OSError, RuntimeError):
+              print("NATIVE_PUBLIC_TCP=DENIED", flush=True)
+          for name, address in (("HOST", "198.51.100.1"), ("LAN", "198.51.100.4"),
+                                ("GATEWAY", "10.0.2.2"), ("ROUTER", "192.0.2.6")):
+              try:
+                  with socket.create_connection((address, 38080), timeout=0.5) as s:
+                      s.sendall(b"fleet-tcp")
+                  print("NATIVE_" + name + "=OK", flush=True)
+              except OSError:
+                  print("NATIVE_" + name + "=DENIED", flush=True)
+              try:
+                  with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                      s.settimeout(0.5)
+                      s.sendto(query, (address, 35353))
+                      s.recv(512)
+                  print("NATIVE_" + name + "_DNS=OK", flush=True)
+              except OSError:
+                  print("NATIVE_" + name + "_DNS=DENIED", flush=True)
+          time.sleep(0.2)
+runcmd:
+  - [sh, -c, '/usr/local/sbin/fleet-native-probe > /dev/ttyS0 2>&1']
+power_state:
+  mode: poweroff
+  timeout: 30
